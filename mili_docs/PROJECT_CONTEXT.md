@@ -375,7 +375,7 @@ Rules:
 
 ### Phase 1 – Core foundation
 
-Implemented/being finalized:
+Committed on `mili-dev` (`f2dac06`):
 - `pet_brain/`
 - PetBrain
 - Mood
@@ -424,6 +424,27 @@ SessionPresence
 Group conversations may eventually need separate emotion state per character.
 
 Do not refactor this ownership split unless explicitly planned for a later phase.
+
+### Phase 2 – Living behavior
+
+Committed on `mili-dev` (`b76356f`..`75cef4b`, plus spec/plan/summary docs). Details: `mili_docs/PHASE_2_SPEC.md`, `PHASE_2_PLAN.md`, `PHASE_2_SUMMARY.md`.
+
+Implemented:
+- `BehaviorScheduler` — one background task while clients are connected, 20 s tick: Context → Daily Rhythm → Mood → Lifecycle → Behavior
+- Backend-owned proactive speaking with cooldown / quiet / hourly cap / ignored backoff / willingness from mood, context and day part; `DO_NOTHING` is a first-class outcome
+- `ai-speak-signal` is only a request through the same `evaluate_client()` path (legacy images discarded)
+- User input preempts a proactive turn; no-overlap invariant is absolute
+- Idle expressions via the silent payload (no LLM, no speech)
+- Lightweight Windows context via ctypes (input idle, process name → category, fullscreen); window titles never read; unknown context fails closed
+- Daily rhythm (per-DayPart mood integration, clock-jump policy) and time-driven lifecycle (idle / sleepy / sleep / away)
+- Config sections `behavior`, `proactive`, `idle_expression`, `context` under `pet_brain_config` (both templates); still disabled by default
+
+Verification: 228/228 unit tests (185 Phase 2 + 43 Phase 1), ruff clean, E2E scenarios 1–6 pass (real Ollama + edge-tts on a spare port with in-memory config; Case 4 and 6 on the desktop frontend).
+
+Known issues carried forward:
+- Upstream websocket send race in `TTSTaskManager` (`AssertionError` in `websockets` `_drain_helper`) — not Phase 2, tracked as a separate task
+- A proactive turn stays reserved until the frontend acknowledges playback (upstream wait without timeout)
+- The user's `conf.yaml` has no `pet_brain_config` section yet; add it (or run the upgrade sync) and set `enabled: True` to use Phase 1–2, and turn off the frontend `allowProactiveSpeak` timer
 
 ## Planned Phases
 
@@ -530,19 +551,11 @@ The phase summary should not replace the permanent project context; it records t
 
 ## Current Priority
 
-Finish and verify Phase 1 cleanly.
+Phase 1 and Phase 2 are committed on `mili-dev` (not pushed).
 
-Before committing:
-- verify EmotionManager behavior and tests
-- verify Permission Core boundary
-- verify PetBrain enable/disable behavior
-- keep frontend untouched
-- keep `conf.yaml` safe/rollback-friendly
-- review diff
-
-Then commit Phase 1 to `mili-dev`.
-
-After that, move to Phase 2:
-**Behavior Scheduler + Idle Behavior + Proactive Speaking + User Activity/Context.**
+Next:
+- Optionally fix the upstream websocket send race (separate task) before long real-world use.
+- Try Phase 2 with real defaults in daily use: enable `pet_brain_config` in `conf.yaml`, turn off the frontend proactive timer, tune `proactive` / `idle_expression` values if needed.
+- Phase 3 (Desktop Pet: movement, motions, desktop interaction) requires forking `Open-LLM-VTuber-Web` source first.
 
 Do not start Phase 3 desktop movement until the frontend source fork/integration is ready.
