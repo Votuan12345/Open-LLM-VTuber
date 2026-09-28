@@ -14,6 +14,7 @@ from ..asr.asr_interface import ASRInterface
 from ..live2d_model import Live2dModel
 from ..tts.tts_interface import TTSInterface
 from ..utils.stream_audio import prepare_audio_payload
+from ..pet_brain import PetBrain
 
 
 # Convert class methods to standalone functions
@@ -50,6 +51,7 @@ async def process_agent_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
+    pet_brain: Optional[PetBrain] = None,
 ) -> str:
     """Process agent output with character information and optional translation"""
     output.display_text.name = character_config.character_name
@@ -65,9 +67,12 @@ async def process_agent_output(
                 websocket_send,
                 tts_manager,
                 translate_engine,
+                pet_brain,
             )
         elif isinstance(output, AudioOutput):
-            full_response = await handle_audio_output(output, websocket_send)
+            full_response = await handle_audio_output(
+                output, websocket_send, live2d_model, pet_brain
+            )
         else:
             logger.warning(f"Unknown output type: {type(output)}")
     except Exception as e:
@@ -88,11 +93,15 @@ async def handle_sentence_output(
     websocket_send: WebSocketSend,
     tts_manager: TTSTaskManager,
     translate_engine: Optional[Any] = None,
+    pet_brain: Optional[PetBrain] = None,
 ) -> str:
     """Handle sentence output type with optional translation support"""
     full_response = ""
     async for display_text, tts_text, actions in output:
         logger.debug(f"🏃 Processing output: '''{tts_text}'''...")
+
+        if pet_brain:
+            actions = pet_brain.emotion.gate(actions, live2d_model)
 
         if translate_engine:
             if len(re.sub(r'[\s.,!?，。！？\'"』」）】\s]+', "", tts_text)):
@@ -116,10 +125,14 @@ async def handle_sentence_output(
 async def handle_audio_output(
     output: AudioOutput,
     websocket_send: WebSocketSend,
+    live2d_model: Optional[Live2dModel] = None,
+    pet_brain: Optional[PetBrain] = None,
 ) -> str:
     """Process and send AudioOutput directly to the client"""
     full_response = ""
     async for audio_path, display_text, transcript, actions in output:
+        if pet_brain:
+            actions = pet_brain.emotion.gate(actions, live2d_model)
         full_response += transcript
         audio_payload = prepare_audio_payload(
             audio_path=audio_path,

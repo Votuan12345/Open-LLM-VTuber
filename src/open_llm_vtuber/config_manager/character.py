@@ -6,6 +6,7 @@ from .asr import ASRConfig
 from .tts import TTSConfig
 from .vad import VADConfig
 from .tts_preprocessor import TTSPreprocessorConfig
+from .pet_brain import PetBrainConfig
 
 from .agent import AgentConfig
 
@@ -26,6 +27,9 @@ class CharacterConfig(I18nMixin):
     vad_config: VADConfig = Field(..., alias="vad_config")
     tts_preprocessor_config: TTSPreprocessorConfig = Field(
         ..., alias="tts_preprocessor_config"
+    )
+    pet_brain_config: PetBrainConfig = Field(
+        default_factory=PetBrainConfig, alias="pet_brain_config"
     )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
@@ -60,6 +64,10 @@ class CharacterConfig(I18nMixin):
         "tts_preprocessor_config": Description(
             en="Configuration for Text-to-Speech Preprocessor",
             zh="语音合成预处理器配置",
+        ),
+        "pet_brain_config": Description(
+            en="Configuration for the PetBrain companion core",
+            zh="PetBrain 伴侣核心配置",
         ),
         "human_name": Description(
             en="Name of the human user in conversation", zh="对话中人类用户的名字"

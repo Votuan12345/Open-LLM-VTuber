@@ -1,6 +1,26 @@
 from dataclasses import dataclass, asdict
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from abc import ABC, abstractmethod
+
+
+@dataclass(frozen=True)
+class EmotionTag:
+    """An emotion tag as written by the LLM and the expression it maps to."""
+
+    name: str
+    expression: int | str
+
+
+@dataclass(frozen=True)
+class EmotionParse:
+    """Result of Live2dModel.parse_emotions for one piece of text."""
+
+    tags: Tuple[EmotionTag, ...] = ()
+    unknown: Tuple[str, ...] = ()
+
+
+# Backend-only fields; never sent to the frontend.
+_INTERNAL_ACTION_FIELDS = ("emotion",)
 
 
 @dataclass
@@ -10,10 +30,15 @@ class Actions:
     expressions: Optional[List[str] | List[int]] = None
     pictures: Optional[List[str]] = None
     sounds: Optional[List[str]] = None
+    emotion: Optional[EmotionParse] = None
 
     def to_dict(self) -> dict:
         """Convert Actions object to a dictionary for JSON serialization"""
-        return {k: v for k, v in asdict(self).items() if v is not None}
+        return {
+            k: v
+            for k, v in asdict(self).items()
+            if v is not None and k not in _INTERNAL_ACTION_FIELDS
+        }
 
 
 class BaseOutput(ABC):

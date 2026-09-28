@@ -13,6 +13,7 @@ from typing import (
 from .types import ToolCallObject
 from .mcp_client import MCPClient
 from .tool_manager import ToolManager
+from ..pet_brain.permission import PermissionGuard, ToolRequest
 
 
 class ToolExecutor:
@@ -20,9 +21,11 @@ class ToolExecutor:
         self,
         mcp_client: MCPClient,
         tool_manager: ToolManager,
+        permission_guard: PermissionGuard | None = None,
     ):
         self._mcp_client = mcp_client
         self._tool_manager = tool_manager
+        self._permission_guard = permission_guard
 
     def parse_tool_call(self, call: Union[Dict[str, Any], ToolCallObject]) -> tuple:
         """Parse tool call from different formats.
@@ -319,6 +322,13 @@ class ToolExecutor:
         if tool_input is None:
             tool_input = {}
 
+        if tool_info and tool_info.related_server:
+            denial = await self._permission_denial(
+                tool_name, tool_info.related_server, tool_input
+            )
+            if denial is not None:
+                return True, denial, {}, [{"type": "error", "text": denial}]
+
         if not tool_info:
             logger.error(f"Tool '{tool_name}' not found in ToolManager.")
             text_content = f"Error: Tool '{tool_name}' is not available."
@@ -380,3 +390,22 @@ class ToolExecutor:
                 is_error = True
 
         return is_error, text_content, metadata, content_items
+
+    async def _permission_denial(
+        self, tool_name: str, server_name: str, tool_input: Any
+    ) -> str | None:
+        """Return a denial message, or None when execution may proceed."""
+        if self._permission_guard is None:
+            return None
+        try:
+            decision = await self._permission_guard.check(
+                ToolRequest(
+                    tool_name=tool_name, server_name=server_name, arguments=tool_input
+                )
+            )
+        except Exception as e:
+            logger.exception(f"[Permission] Check failed for '{tool_name}': {e}")
+            return f"Permission denied for tool '{tool_name}': permission check failed."
+        if decision.allowed:
+            return None
+        return f"Permission denied for tool '{tool_name}': {decision.reason}."

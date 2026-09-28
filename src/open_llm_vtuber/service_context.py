@@ -23,8 +23,10 @@ from .tts.tts_factory import TTSFactory
 from .vad.vad_factory import VADFactory
 from .agent.agent_factory import AgentFactory
 from .translate.translate_factory import TranslateFactory
+from .pet_brain import PetBrain
 
 from .config_manager import (
+    PetBrainConfig,
     Config,
     AgentConfig,
     CharacterConfig,
@@ -60,6 +62,9 @@ class ServiceContext:
         self.tool_manager: ToolManager | None = None
         self.mcp_client: MCPClient | None = None
         self.tool_executor: ToolExecutor | None = None
+
+        # None when pet_brain_config.enabled is False
+        self.pet_brain: PetBrain | None = None
 
         # the system prompt is a combination of the persona prompt and live2d expression prompt
         self.system_prompt: str = None
@@ -168,7 +173,13 @@ class ServiceContext:
 
             # 5. Initialize ToolExecutor
             if self.mcp_client and self.tool_manager:
-                self.tool_executor = ToolExecutor(self.mcp_client, self.tool_manager)
+                self.tool_executor = ToolExecutor(
+                    self.mcp_client,
+                    self.tool_manager,
+                    permission_guard=self.pet_brain.permission
+                    if self.pet_brain
+                    else None,
+                )
                 logger.info("ToolExecutor initialized for this session.")
             else:
                 logger.warning(
@@ -213,6 +224,7 @@ class ServiceContext:
         tool_adapter: ToolAdapter | None = None,
         send_text: Callable = None,
         client_uid: str = None,
+        pet_brain: PetBrain | None = None,
     ) -> None:
         """
         Load the ServiceContext with the reference of the provided instances.
@@ -237,6 +249,8 @@ class ServiceContext:
         self.tool_adapter = tool_adapter
         self.send_text = send_text
         self.client_uid = client_uid
+        # Shared by reference, like agent_engine
+        self.pet_brain = pet_brain
 
         # Initialize session-specific MCP components
         await self._init_mcp_components(
@@ -290,16 +304,23 @@ class ServiceContext:
             logger.info("Initializing shared ToolAdapter within load_from_config.")
             self.tool_adapter = ToolAdapter(server_registery=self.mcp_server_registery)
 
+        # PetBrain must exist before MCP init so the ToolExecutor gets its guard
+        pet_brain_replaced = self.init_pet_brain(
+            config.character_config.pet_brain_config
+        )
+
         # Initialize MCP Components before initializing Agent
         await self._init_mcp_components(
             config.character_config.agent_config.agent_settings.basic_memory_agent.use_mcpp,
             config.character_config.agent_config.agent_settings.basic_memory_agent.mcp_enabled_servers,
         )
 
-        # init agent from character config
+        # init agent from character config. A new PetBrain means a new permission
+        # guard, so the agent must be rebuilt to pick up the new ToolExecutor.
         await self.init_agent(
             config.character_config.agent_config,
             config.character_config.persona_prompt,
+            force=pet_brain_replaced,
         )
 
         self.init_translate(
@@ -361,12 +382,31 @@ class ServiceContext:
         else:
             logger.info("VAD already initialized with the same config.")
 
-    async def init_agent(self, agent_config: AgentConfig, persona_prompt: str) -> None:
+    def init_pet_brain(self, pet_brain_config: PetBrainConfig) -> bool:
+        """Create, keep or drop the PetBrain. Returns True if the instance changed."""
+        if not pet_brain_config.enabled:
+            replaced = self.pet_brain is not None
+            if replaced:
+                logger.info("[PetBrain] Disabled by config")
+            self.pet_brain = None
+            return replaced
+
+        if self.pet_brain is not None and self.pet_brain.config == pet_brain_config:
+            logger.debug("[PetBrain] Already initialized with the same config.")
+            return False
+
+        self.pet_brain = PetBrain(pet_brain_config)
+        return True
+
+    async def init_agent(
+        self, agent_config: AgentConfig, persona_prompt: str, force: bool = False
+    ) -> None:
         """Initialize or update the LLM engine based on agent configuration."""
         logger.info(f"Initializing Agent: {agent_config.conversation_agent_choice}")
 
         if (
-            self.agent_engine is not None
+            not force
+            and self.agent_engine is not None
             and agent_config == self.character_config.agent_config
             and persona_prompt == self.character_config.persona_prompt
         ):

@@ -198,6 +198,7 @@ class WebSocketHandler:
             tool_adapter=self.default_context_cache.tool_adapter,
             send_text=send_text,
             client_uid=client_uid,
+            pet_brain=self.default_context_cache.pet_brain,
         )
         return session_service_context
 

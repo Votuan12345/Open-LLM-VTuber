@@ -83,9 +83,11 @@ def actions_extractor(live2d_model: Live2dModel):
                         tag.state in [TagState.START, TagState.END]
                         for tag in sentence.tags
                     ):
-                        expressions = live2d_model.extract_emotion(sentence.text)
-                        if expressions:
-                            actions.expressions = expressions
+                        parsed = live2d_model.parse_emotions(sentence.text)
+                        if parsed.tags:
+                            actions.expressions = [t.expression for t in parsed.tags]
+                        if parsed.tags or parsed.unknown:
+                            actions.emotion = parsed
                     yield sentence, actions  # Yield the tuple
                 elif isinstance(item, dict):
                     # Pass through dictionaries

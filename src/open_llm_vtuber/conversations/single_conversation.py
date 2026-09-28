@@ -17,6 +17,7 @@ from .types import WebSocketSend
 from .tts_manager import TTSTaskManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
+from ..pet_brain import BrainEvent
 
 # Import necessary types from agent outputs
 from ..agent.output_types import SentenceOutput, AudioOutput
@@ -48,6 +49,7 @@ async def process_single_conversation(
     # Create TTSTaskManager for this conversation
     tts_manager = TTSTaskManager()
     full_response = ""  # Initialize full_response here
+    pet_brain = context.pet_brain
 
     try:
         # Send initial signals
@@ -58,6 +60,12 @@ async def process_single_conversation(
         input_text = await process_user_input(
             user_input, context.asr_engine, websocket_send
         )
+
+        if pet_brain:
+            is_proactive = bool(metadata and metadata.get("proactive_speak"))
+            pet_brain.notify(
+                BrainEvent.PROACTIVE_TRIGGER if is_proactive else BrainEvent.USER_INPUT
+            )
 
         # Create batch input
         batch_input = create_batch_input(
@@ -101,6 +109,8 @@ async def process_single_conversation(
                     await websocket_send(json.dumps(output_item))
 
                 elif isinstance(output_item, (SentenceOutput, AudioOutput)):
+                    if pet_brain:
+                        pet_brain.notify(BrainEvent.RESPONSE_START)
                     # Handle SentenceOutput or AudioOutput
                     response_part = await process_agent_output(
                         output=output_item,
@@ -110,6 +120,7 @@ async def process_single_conversation(
                         websocket_send=websocket_send,  # Pass websocket_send for audio/tts messages
                         tts_manager=tts_manager,
                         translate_engine=context.translate_engine,
+                        pet_brain=pet_brain,
                     )
                     # Ensure response_part is treated as a string before concatenation
                     response_part_str = (
@@ -159,12 +170,19 @@ async def process_single_conversation(
             )
             logger.info(f"AI response: {full_response}")
 
+        if pet_brain:
+            pet_brain.notify(BrainEvent.RESPONSE_END)
+
         return full_response  # Return accumulated full_response
 
     except asyncio.CancelledError:
         logger.info(f"🤡👍 Conversation {session_emoji} cancelled because interrupted.")
+        if pet_brain:
+            pet_brain.notify(BrainEvent.INTERRUPTED)
         raise
     except Exception as e:
+        if pet_brain:
+            pet_brain.notify(BrainEvent.ERROR)
         logger.error(f"Error in conversation chain: {e}")
         await websocket_send(
             json.dumps({"type": "error", "message": f"Conversation error: {str(e)}"})

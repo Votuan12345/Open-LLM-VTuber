@@ -494,6 +494,22 @@ character_config:
         source_lang: 'zh'
         target_lang: 'ja'
 
+  # =================== PetBrain (Mili companion core) ===================
+  pet_brain_config:
+    enabled: False # False = original behavior. True = mood/lifecycle state, emotion gate, and tool permission enforcement.
+
+    emotion:
+      fallback_emotion: 'neutral' # emotionMap key used when all requested expressions are invalid
+
+    permission:
+      # Permission level per MCP tool name: read / interact / destructive.
+      # Any tool NOT listed here is destructive and requires confirmation (denied until a confirmation UI exists).
+      tool_levels:
+        get_current_time: 'read'
+        convert_time: 'read'
+        search: 'read'
+        fetch_content: 'read'
+
 # Live Streaming Integration
 live_config:
   bilibili_live:

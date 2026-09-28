@@ -1,6 +1,14 @@
 import json
+import re
+from typing import List
+
 import chardet
 from loguru import logger
+
+from .agent.output_types import EmotionParse, EmotionTag
+
+# Bracketed single word, used only to report tags that are not in emotionMap.
+_WORD_TAG = re.compile(r"\[([a-z_]{1,32})\]")
 
 # This class will only prepare the payload for the live2d model
 # the process of sending the payload should be done by the caller
@@ -154,22 +162,38 @@ class Live2dModel:
             list: A list of values of the emotions found in the string. An empty list is returned if no emotions are found.
         """
 
-        expression_list = []
-        str_to_check = str_to_check.lower()
+        return [tag.expression for tag in self.parse_emotions(str_to_check).tags]
+
+    def parse_emotions(self, text: str) -> EmotionParse:
+        """
+        The single parser for emotion tags in LLM text.
+
+        Known tags are the emotionMap keys, matched in order of appearance.
+        Word-like brackets that are not emotionMap keys (e.g. "[happy]") are
+        reported in `unknown`; other bracket text such as "[1]" is ignored.
+        """
+        tags: List[EmotionTag] = []
+        unknown: List[str] = []
+        lower = text.lower()
 
         i = 0
-        while i < len(str_to_check):
-            if str_to_check[i] != "[":
+        while i < len(lower):
+            if lower[i] != "[":
                 i += 1
                 continue
             for key in self.emo_map.keys():
                 emo_tag = f"[{key}]"
-                if str_to_check[i : i + len(emo_tag)] == emo_tag:
-                    expression_list.append(self.emo_map[key])
+                if lower[i : i + len(emo_tag)] == emo_tag:
+                    tags.append(EmotionTag(name=key, expression=self.emo_map[key]))
                     i += len(emo_tag) - 1
                     break
+            else:
+                match = _WORD_TAG.match(lower, i)
+                if match:
+                    unknown.append(match.group(1))
+                    i = match.end() - 1
             i += 1
-        return expression_list
+        return EmotionParse(tags=tuple(tags), unknown=tuple(unknown))
 
     def remove_emotion_keywords(self, target_str: str) -> str:
         """
