@@ -10,3 +10,6 @@ class BrainEvent(str, Enum):
     RESPONSE_END = "response_end"
     INTERRUPTED = "interrupted"
     ERROR = "error"
+    USER_RETURNED = "user_returned"
+    PROACTIVE_SPOKEN = "proactive_spoken"
+    PROACTIVE_IGNORED = "proactive_ignored"
