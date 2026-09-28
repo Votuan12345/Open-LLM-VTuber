@@ -6,6 +6,7 @@ import sys
 import unittest
 from collections import deque
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from pydantic import ValidationError
 
@@ -32,6 +33,8 @@ from src.open_llm_vtuber.pet_brain.behavior import (
     effective_min_interval_s,
     willingness,
 )
+from src.open_llm_vtuber.pet_brain.eligibility import ClientEligibility
+from src.open_llm_vtuber.pet_brain.proactive_prompt import build_context_block
 from src.open_llm_vtuber.pet_brain.context import (
     ContextSnapshot,
     NullContextSensor,
@@ -1057,6 +1060,331 @@ class SelectorTests(unittest.TestCase):
             [(d.kind, d.reason, d.emotion) for d in results_a],
             [(d.kind, d.reason, d.emotion) for d in results_b],
         )
+
+
+def make_brain(behavior_enabled: bool = True):
+    cfg = PetBrainConfig(enabled=True)
+    cfg.behavior.enabled = behavior_enabled
+    return SimpleNamespace(config=cfg)
+
+
+def make_presence(
+    last_user_interaction=None,
+    reserved=False,
+    user_turn_pending=False,
+):
+    return ClientPresence(
+        uid="u",
+        connected_at=0.0,
+        last_user_interaction=last_user_interaction,
+        reserved=reserved,
+        user_turn_pending=user_turn_pending,
+    )
+
+
+class _FakeTask:
+    def __init__(self, is_done: bool):
+        self._done = is_done
+
+    def done(self) -> bool:
+        return self._done
+
+
+class ClientEligibilityTests(unittest.TestCase):
+    def _make(
+        self,
+        connections=None,
+        contexts=None,
+        tasks=None,
+        groups=None,
+    ):
+        group_map = groups or {}
+
+        class _GroupManager:
+            def get_client_group(self, uid):
+                return group_map.get(uid)
+
+        return ClientEligibility(
+            client_connections=connections
+            if connections is not None
+            else {"a": object()},
+            client_contexts=contexts
+            if contexts is not None
+            else {"a": SimpleNamespace(pet_brain=make_brain())},
+            current_conversation_tasks=tasks if tasks is not None else {},
+            chat_group_manager=_GroupManager(),
+        )
+
+    def test_brain_for_none_when_no_context(self):
+        elig = self._make(contexts={})
+        self.assertIsNone(elig.brain_for("a"))
+
+    def test_brain_for_none_when_brain_missing(self):
+        elig = self._make(contexts={"a": SimpleNamespace(pet_brain=None)})
+        self.assertIsNone(elig.brain_for("a"))
+
+    def test_brain_for_none_when_behavior_disabled(self):
+        elig = self._make(
+            contexts={
+                "a": SimpleNamespace(pet_brain=make_brain(behavior_enabled=False))
+            }
+        )
+        self.assertIsNone(elig.brain_for("a"))
+
+    def test_brain_for_returns_brain_when_enabled(self):
+        brain = make_brain()
+        elig = self._make(contexts={"a": SimpleNamespace(pet_brain=brain)})
+        self.assertIs(elig.brain_for("a"), brain)
+
+    def test_in_group_false_when_no_group(self):
+        elig = self._make(groups={})
+        self.assertFalse(elig.in_group("a"))
+
+    def test_in_group_false_when_solo_group(self):
+        elig = self._make(groups={"a": SimpleNamespace(members={"a"})})
+        self.assertFalse(elig.in_group("a"))
+
+    def test_in_group_true_when_multi_member(self):
+        elig = self._make(groups={"a": SimpleNamespace(members={"a", "b"})})
+        self.assertTrue(elig.in_group("a"))
+
+    def test_handles_true_when_all_conditions_met(self):
+        elig = self._make()
+        self.assertTrue(elig.handles("a"))
+
+    def test_handles_false_when_not_connected(self):
+        elig = self._make(connections={})
+        self.assertFalse(elig.handles("a"))
+
+    def test_handles_false_when_in_group(self):
+        elig = self._make(groups={"a": SimpleNamespace(members={"a", "b"})})
+        self.assertFalse(elig.handles("a"))
+
+    # --- check() reasons, in order ---------------------------------------
+
+    def test_check_not_connected(self):
+        elig = self._make(connections={})
+        self.assertEqual(elig.check("a", None), "not_connected")
+
+    def test_check_not_handled_missing_context(self):
+        elig = self._make(contexts={})
+        self.assertEqual(elig.check("a", None), "not_handled")
+
+    def test_check_not_handled_brain_none(self):
+        elig = self._make(contexts={"a": SimpleNamespace(pet_brain=None)})
+        self.assertEqual(elig.check("a", None), "not_handled")
+
+    def test_check_not_handled_behavior_disabled(self):
+        elig = self._make(
+            contexts={
+                "a": SimpleNamespace(pet_brain=make_brain(behavior_enabled=False))
+            }
+        )
+        self.assertEqual(elig.check("a", None), "not_handled")
+
+    def test_check_in_group(self):
+        elig = self._make(groups={"a": SimpleNamespace(members={"a", "b"})})
+        self.assertEqual(elig.check("a", None), "in_group")
+
+    def test_check_reserved(self):
+        elig = self._make()
+        self.assertEqual(elig.check("a", make_presence(reserved=True)), "reserved")
+
+    def test_check_user_turn_pending(self):
+        elig = self._make()
+        self.assertEqual(
+            elig.check("a", make_presence(user_turn_pending=True)), "user_turn_pending"
+        )
+
+    def test_check_conversation_running(self):
+        elig = self._make(tasks={"a": _FakeTask(is_done=False)})
+        self.assertEqual(elig.check("a", make_presence()), "conversation_running")
+
+    def test_check_done_task_is_eligible(self):
+        elig = self._make(tasks={"a": _FakeTask(is_done=True)})
+        self.assertIsNone(elig.check("a", make_presence()))
+
+    def test_check_none_task_entry_is_eligible(self):
+        elig = self._make(tasks={"a": None})
+        self.assertIsNone(elig.check("a", make_presence()))
+
+    def test_check_none_presence_is_eligible(self):
+        elig = self._make()
+        self.assertIsNone(elig.check("a", None))
+
+    def test_check_none_when_eligible(self):
+        elig = self._make()
+        self.assertIsNone(elig.check("a", make_presence(last_user_interaction=5.0)))
+
+    # --- order() ----------------------------------------------------------
+
+    def test_order_most_recent_interaction_first(self):
+        elig = self._make()
+        presences = {
+            "a": make_presence(last_user_interaction=10.0),
+            "b": make_presence(last_user_interaction=50.0),
+            "c": make_presence(last_user_interaction=None),
+        }
+        self.assertEqual(elig.order(["a", "b", "c"], presences), ["b", "a", "c"])
+
+    def test_order_ties_broken_by_uid(self):
+        elig = self._make()
+        presences = {
+            "b": make_presence(last_user_interaction=10.0),
+            "a": make_presence(last_user_interaction=10.0),
+        }
+        self.assertEqual(elig.order(["b", "a"], presences), ["a", "b"])
+
+    def test_order_none_always_last(self):
+        elig = self._make()
+        presences = {
+            "a": make_presence(last_user_interaction=None),
+            "b": make_presence(last_user_interaction=None),
+        }
+        self.assertEqual(elig.order(["a", "b"], presences), ["a", "b"])
+
+
+class ProactiveContextBlockTests(unittest.TestCase):
+    def test_full_block_contains_expected_lines(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={"happiness": 0.7, "energy": 0.65, "boredom": 0.1},
+            category="coding",
+            process_name="Code.exe",
+            user_idle_seconds=180.0,
+            returned_after_s=600.0,
+            trigger=Trigger.TICK,
+        )
+        self.assertIn("14:05 (afternoon)", block)
+        self.assertIn("coding (Code.exe), idle 3 min", block)
+        self.assertIn("came back after 10 min away", block)
+        self.assertIn("you chose to", block)
+        self.assertIn("cheerful", block)
+
+    def test_request_trigger_wording(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={},
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.REQUEST,
+        )
+        self.assertIn("the app asked you to", block)
+
+    def test_no_user_activity_line_when_unknown(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={},
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.TICK,
+        )
+        self.assertNotIn("User activity", block)
+
+    def test_no_returned_line_when_none(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={},
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.TICK,
+        )
+        self.assertNotIn("came back", block)
+
+    def test_traits_calm_when_none_qualify(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={"happiness": 0.1},
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.TICK,
+        )
+        self.assertIn("feeling calm", block)
+
+    def test_traits_ordered_by_value_descending(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={"boredom": 0.65, "curiosity": 0.9, "social_need": 0.75},
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.TICK,
+        )
+        idx_curious = block.index("curious")
+        idx_chatting = block.index("like chatting")
+        idx_bored = block.index("bored")
+        self.assertLess(idx_curious, idx_chatting)
+        self.assertLess(idx_chatting, idx_bored)
+
+    def test_traits_capped_at_three(self):
+        block = build_context_block(
+            now_wall=datetime(2024, 1, 1, 14, 5),
+            day_part=DayPart.AFTERNOON,
+            lifecycle=LifecyclePhase.ACTIVE,
+            mood={
+                "happiness": 0.95,
+                "energy": 0.9,
+                "curiosity": 0.85,
+                "social_need": 0.8,
+            },
+            category=None,
+            process_name=None,
+            user_idle_seconds=None,
+            returned_after_s=None,
+            trigger=Trigger.TICK,
+        )
+        self.assertNotIn("like chatting", block)
+
+    def test_no_window_or_title_substring_anywhere(self):
+        cases = [
+            dict(
+                now_wall=datetime(2024, 1, 1, 14, 5),
+                day_part=DayPart.LATE_NIGHT,
+                lifecycle=LifecyclePhase.SLEEPY,
+                mood={"sleepiness": 0.9},
+                category="gaming",
+                process_name="game.exe",
+                user_idle_seconds=5.0,
+                returned_after_s=30.0,
+                trigger=Trigger.REQUEST,
+            ),
+            dict(
+                now_wall=datetime(2024, 6, 15, 9, 30),
+                day_part=DayPart.MORNING,
+                lifecycle=LifecyclePhase.ACTIVE,
+                mood={},
+                category=None,
+                process_name=None,
+                user_idle_seconds=None,
+                returned_after_s=None,
+                trigger=Trigger.TICK,
+            ),
+        ]
+        for kwargs in cases:
+            block = build_context_block(**kwargs)
+            self.assertNotIn("window", block.lower())
+            self.assertNotIn("title", block.lower())
 
 
 if __name__ == "__main__":
