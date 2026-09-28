@@ -1,5 +1,7 @@
 """Phase 2 behavior tests. Run from repo root: uv run python -m unittest tests.test_behavior_phase2 -v"""
 
+import inspect
+import sys
 import unittest
 from datetime import datetime, timedelta
 
@@ -18,6 +20,13 @@ from src.open_llm_vtuber.config_manager import (
 from loguru import logger
 
 from src.open_llm_vtuber.pet_brain import BrainEvent, Mood
+from src.open_llm_vtuber.pet_brain import context as context_module
+from src.open_llm_vtuber.pet_brain.context import (
+    NullContextSensor,
+    WindowsContextSensor,
+    classify_process,
+    idle_seconds_from_ticks,
+)
 from src.open_llm_vtuber.pet_brain.mood import MOOD_KEYS, MoodState
 from src.open_llm_vtuber.pet_brain.rhythm import (
     DayPart,
@@ -341,6 +350,73 @@ class MoodTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(
             mood._state.social_need, start_social_need + 0.10, places=6
         )
+
+
+class ContextTests(unittest.TestCase):
+    def test_idle_seconds_from_ticks_basic(self):
+        self.assertEqual(idle_seconds_from_ticks(5000, 2000), 3.0)
+
+    def test_idle_seconds_from_ticks_wraps(self):
+        self.assertEqual(idle_seconds_from_ticks(1000, 0xFFFFFFFF - 999), 2.0)
+
+    def test_classify_process(self):
+        table = {"Code.exe": "coding", "Unity.exe": "unity"}
+        self.assertEqual(classify_process("CODE.EXE", table), "coding")
+        self.assertEqual(
+            classify_process(r"C:\Program Files\Unity\Unity.exe", table), "unity"
+        )
+        self.assertEqual(classify_process("notepad.exe", table), "unknown")
+        self.assertIsNone(classify_process(None, table))
+
+    def test_per_field_failure_is_isolated(self):
+        class _PartialFailSensor(WindowsContextSensor):
+            def _read_idle_seconds(self) -> float:
+                return 12.5
+
+            def _read_process_name(self) -> str:
+                raise RuntimeError("boom")
+
+            def _read_fullscreen(self) -> bool:
+                return True
+
+        sensor = _PartialFailSensor(wall_clock=lambda: datetime(2024, 1, 1, 9, 0))
+        with _LoguruCapture("DEBUG"):
+            snap = sensor.sample()
+        self.assertIsNone(snap.process_name)
+        self.assertEqual(snap.user_idle_seconds, 12.5)
+        self.assertTrue(snap.fullscreen)
+
+    def test_idle_failure_is_none_not_zero(self):
+        class _IdleFailSensor(WindowsContextSensor):
+            def _read_idle_seconds(self) -> float:
+                raise RuntimeError("boom")
+
+            def _read_process_name(self) -> str:
+                return "Code.exe"
+
+            def _read_fullscreen(self) -> bool:
+                return False
+
+        sensor = _IdleFailSensor(wall_clock=lambda: datetime(2024, 1, 1, 9, 0))
+        with _LoguruCapture("DEBUG"):
+            snap = sensor.sample()
+        self.assertIsNone(snap.user_idle_seconds)
+        self.assertEqual(snap.process_name, "Code.exe")
+        self.assertFalse(snap.fullscreen)
+
+    def test_null_sensor_all_none(self):
+        snap = NullContextSensor(wall_clock=lambda: datetime(2024, 1, 1)).sample()
+        self.assertIsNone(snap.user_idle_seconds)
+        self.assertIsNone(snap.process_name)
+        self.assertIsNone(snap.fullscreen)
+
+    def test_source_guard_no_window_text(self):
+        self.assertNotIn("GetWindowText", inspect.getsource(context_module))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows-only smoke test")
+    def test_windows_sensor_smoke(self):
+        snap = WindowsContextSensor().sample()
+        self.assertTrue(snap.user_idle_seconds is None or snap.user_idle_seconds >= 0)
 
 
 if __name__ == "__main__":
