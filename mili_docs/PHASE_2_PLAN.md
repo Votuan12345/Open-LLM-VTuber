@@ -80,13 +80,13 @@
   - `ContextConfig(enabled=True, away_after_min=10.0, process_categories: Dict[str, Category])` where `Category = Literal["coding","unity","office","browser","media","gaming","unknown"]`, default = the spec §5.4 table
   - `PetBrainConfig` gains `behavior`, `proactive`, `idle_expression`, `context` (all `default_factory`)
   - `PetBrain.update_config(config: PetBrainConfig) -> None`, used by `init_pet_brain`
-- Validation: probabilities and `threshold` use `Field(ge=0, le=1)`; intervals and counts use `ge=0`. Every field has an `I18nMixin` description (en + zh), following the existing classes.
+- Validation: probabilities and `threshold` use `Field(ge=0, le=1)`; intervals and counts use `ge=0`; `ProactiveConfig` has a `model_validator` rejecting `max_backoff_min < min_interval_min` (otherwise the verbatim backoff formula could undercut the minimum interval). Every field has an `I18nMixin` description (en + zh), following the existing classes.
 
 - [ ] **Step 1: Write failing tests** in class `Phase2ConfigTests`:
   - `test_defaults` — `PetBrainConfig()` has the values listed above, and `process_categories["Code.exe"] == "coding"`.
   - `test_templates_validate_with_phase2_sections` — both templates validate; `character_config.pet_brain_config.behavior.enabled is True`; `proactive.min_interval_min == 10`.
   - `test_missing_sections_use_defaults` — `PetBrainConfig.model_validate({"enabled": True})` validates.
-  - `test_invalid_values_rejected` — `chance: 1.5`, `threshold: -0.1` and a category `"work"` each raise `ValidationError`.
+  - `test_invalid_values_rejected` — `chance: 1.5`, `threshold: -0.1`, a category `"work"`, and `min_interval_min: 10` with `max_backoff_min: 5` each raise `ValidationError`.
   - `test_phase2_change_keeps_brain_and_agent` — `ctx = ServiceContext(); ctx.init_pet_brain(cfg_a)`; `b = ctx.pet_brain`; `cfg_b` = `cfg_a` with `proactive.chance=0.9` → `init_pet_brain(cfg_b)` returns `False`, `ctx.pet_brain is b`, `b.config.proactive.chance == 0.9`.
   - `test_phase1_change_still_replaces_brain` — a changed `permission.tool_levels` returns `True` and gives a new instance.
 - [ ] **Step 2:** Run `uv run python -m unittest tests.test_behavior_phase2 -v` → FAIL (import errors).
@@ -147,7 +147,7 @@
 advance():
   now_mono, now_wall = clock(), wall_clock()
   elapsed = now_mono - last_mono
-  if elapsed <= 0: re-anchor wall only; return
+  if elapsed <= 0: last_mono, last_wall = now_mono, now_wall; return
   if |(now_wall - last_wall).total_seconds() - elapsed| <= CLOCK_JUMP_TOLERANCE_S:
       segments = split_by_day_part(last_wall, last_wall + timedelta(seconds=elapsed))
   else:
@@ -274,7 +274,7 @@ The **scheduler** computes `quiet_seconds` (Task 8). When it has no conversation
   - `@dataclass(frozen=True) SelectionInput(trigger, now: float, presence: ClientPresence, activity: ActivityState, lifecycle: LifecyclePhase, mood: Mapping[str, float], context: ContextSnapshot, category: Optional[str], config: PetBrainConfig, emo_map: Mapping[str, Any])`
   - `willingness(mood, category: str, day_part: DayPart, returned_bonus: bool) -> float`
   - `choose_idle_emotion(mood, emo_map) -> Optional[str]`
-  - `effective_min_interval_s(cfg: ProactiveConfig, ignored_count: int) -> float` = `min(cfg.min_interval_min * 2**ignored_count, max(cfg.max_backoff_min, cfg.min_interval_min)) * 60`
+  - `effective_min_interval_s(cfg: ProactiveConfig, ignored_count: int) -> float` = `min(cfg.min_interval_min * 2**ignored_count, cfg.max_backoff_min) * 60` (spec formula verbatim; `max_backoff_min >= min_interval_min` is guaranteed by config validation, Task 1)
   - `BehaviorSelector(rng: random.Random)` with `select(inp: SelectionInput) -> Decision`
 - Constants:
   - `WANT_WEIGHTS = {"social_need": 0.5, "boredom": 0.3, "curiosity": 0.2}`
