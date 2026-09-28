@@ -341,7 +341,7 @@ proactive_task running?  ── no ──► return
   ↓ yes (synchronous)
 mark it preempted, task.cancel()
   ↓  (await)
-wait for the cancelled task to finish (timeout 5 s)
+wait until the cancelled task has actually finished (no upper bound; 5 s is only a diagnostic threshold)
   → its CancelledError path runs: Phase 1 INTERRUPTED event, TTS cleanup
   → done-callback releases `reserved`; preempted/cancelled ⇒ never awaiting a reply, never ignored
   ↓
@@ -352,7 +352,11 @@ return → caller creates the user task and registers it in current_conversation
 - `user_turn_pending` closes the window during the `await`: a tick or request in that window sees it and returns `DO_NOTHING (conversation lock)`. After the user task is registered, the running task itself keeps the lock.
 - `agent_engine.handle_interrupt()` is **not** called for a preempted proactive turn. Proactive turns run with `skip_memory` / `skip_history`, so there is no partial response to record. This differs from a frontend `interrupt-signal`, which keeps its existing path.
 - The backend does **not** send `control: interrupt` to the frontend here. That would make the frontend send `interrupt-signal` back, which could cancel the *new* user task. Audio the frontend has already received is stopped by the frontend's own interrupt-on-input behavior. This must be verified in E2E and no frontend change is made.
-- If the cancelled task does not finish within 5 s (not expected: the cancel path only notifies and runs synchronous cleanup), log `[Proactive] preempt timeout` at error level and continue with the user turn. User input is never blocked indefinitely.
+- **The no-overlap invariant is absolute.** The user task is created and registered only after the proactive task has really finished.
+  - If the task has not finished within 5 s (not expected: the cancel path only notifies and runs synchronous cleanup), log `[Proactive] preempt still waiting after 5s` at error level as a diagnostic, and **keep waiting**.
+  - The wait uses `asyncio.wait` / `asyncio.shield` so the diagnostic timer never cancels or abandons the wait.
+  - `user_turn_pending` stays `True` for the whole wait, so no new proactive turn can be committed.
+  - Consequence: a proactive task that ignores cancellation would delay that client's user turn until it ends. This is accepted in exchange for the invariant, and it is made visible by the error log.
 - A frontend `interrupt-signal` during a proactive turn cancels it through the existing handler. The task ends cancelled, so it is also never counted as ignored.
 - Clients not handled by the scheduler keep today's path unchanged.
 
@@ -547,7 +551,12 @@ Stdlib `unittest`. Clock (monotonic + wall), sensor and random are injected; no 
 - A tick or request during the preempt `await` window → `DO_NOTHING (conversation lock)` because of `user_turn_pending`.
 - A frontend `interrupt-signal` during a proactive turn → not counted as ignored.
 - A proactive turn that completed normally and got no reply within `ignored_after_min` → ignored exactly once.
-- Preempt timeout path: a task that does not finish in time → error logged, user turn still starts.
+- Preempt slow path: a fake proactive task that delays its cancellation beyond 5 s. Expected:
+  - the diagnostic error is logged;
+  - the user task is **not** created while the proactive task is still running;
+  - it is created right after the proactive task finishes;
+  - no tick or request commits a proactive turn during the wait;
+  - at no point do two conversation-producing tasks for the client coexist. This is asserted by sampling `current_conversation_tasks` and the proactive task state throughout the wait. The 5 s diagnostic threshold is a scheduler constructor argument, so the test injects a small value instead of sleeping.
 
 **Scheduler lifecycle**
 - 0→1 creates a task; a second client creates no new task; 1→0 cancels it and clears state.
@@ -585,6 +594,7 @@ Stdlib `unittest`. Clock (monotonic + wall), sensor and random are injected; no 
 - **Idle expression rendering** in the built frontend is unverified. A silent payload may show an empty subtitle or be reset by the frontend idle motion. Mitigation: E2E check; `idle_expression.enabled: False`.
 - **Frontend timer still on:** if the user leaves `allowProactiveSpeak` on, requests arrive every few seconds. They are refused by the gates, but they produce info logs. Documented; the user turns the timer off.
 - **Frontend playback after preemption:** the backend stops producing proactive output before the user turn starts, but audio already delivered to the frontend is stopped only by the frontend's own interrupt-on-input behavior. Verified in E2E; no frontend change in Phase 2.
+- **Stuck proactive task:** because preemption waits without an upper bound (§8.6), a proactive task that ignores cancellation would delay that client's user turn. This is logged as an error after 5 s and accepted to keep the no-overlap invariant absolute.
 - **Overlapping user turns** (a second user input while a user turn runs) keep today's overwrite behavior; out of Phase 2 scope.
 - **Wall-clock jumps** skip rhythm trends for the affected interval (§6.1), so mood can briefly lag the "correct" day-part effect. This is accepted.
 - **Shared brain activity** (Phase 1 known issue) means one client talking blocks proactive for others on the same brain. This is intended for Phase 2.
