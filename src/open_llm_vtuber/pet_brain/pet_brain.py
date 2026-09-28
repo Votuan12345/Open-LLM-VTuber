@@ -1,15 +1,34 @@
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from loguru import logger
 
 from ..config_manager.pet_brain import PetBrainConfig
+from .context import ContextSnapshot
 from .emotion_manager import EmotionManager
 from .events import BrainEvent
-from .lifecycle import Lifecycle
+from .lifecycle import Lifecycle, LifecycleInputs
 from .mood import Mood
 from .permission import ConfirmationProvider, PermissionGuard
+
+# Categories that count as "focused" for `Mood.focus_context_active`, and the
+# idle threshold below which the user is still considered engaged with them.
+FOCUS_CATEGORIES = frozenset({"coding", "unity"})
+FOCUS_IDLE_THRESHOLD_S = 120
+
+
+@dataclass(frozen=True)
+class BrainTickInputs:
+    """Inputs the scheduler assembles once per tick for `PetBrain.tick`."""
+
+    context: ContextSnapshot
+    category: Optional[str]
+    quiet_seconds: float
+    conversation_running: bool
+    user_returned: bool
 
 
 class ActivityState(str, Enum):
@@ -51,12 +70,13 @@ class PetBrain:
         config: PetBrainConfig,
         confirmation: ConfirmationProvider | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = datetime.now,
     ):
         self.config = config
         self._clock = clock
         self.activity = ActivityState.IDLE
         self.activity_since = clock()
-        self.mood = Mood(clock=clock)
+        self.mood = Mood(clock=clock, wall_clock=wall_clock)
         self.lifecycle = Lifecycle(clock=clock)
         self.emotion = EmotionManager(
             fallback_emotion=config.emotion.fallback_emotion, clock=clock
@@ -83,6 +103,38 @@ class PetBrain:
         self.mood.apply_event(event)
         if details:
             logger.debug(f"[PetBrain] {event.value} details={details}")
+
+    def tick(self, inputs: BrainTickInputs) -> None:
+        """Time-driven update, called by the scheduler every ~20s (spec §7.1).
+
+        Order: mood.advance() (using the previous tick's focus flag) → set the
+        focus flag for the next tick → apply user_returned → lifecycle.evaluate
+        using the mood values just updated in this same tick.
+        """
+
+        self.mood.advance()
+
+        idle = inputs.context.user_idle_seconds
+        self.mood.focus_context_active = (
+            inputs.category in FOCUS_CATEGORIES
+            and idle is not None
+            and idle < FOCUS_IDLE_THRESHOLD_S
+        )
+
+        if inputs.user_returned:
+            self.notify(BrainEvent.USER_RETURNED)
+
+        sleepiness = self.mood.snapshot()["sleepiness"]
+        self.lifecycle.evaluate(
+            LifecycleInputs(
+                sleepiness=sleepiness,
+                user_idle_seconds=idle,
+                quiet_seconds=inputs.quiet_seconds,
+                conversation_running=inputs.conversation_running,
+                away_after_seconds=self.config.context.away_after_min * 60,
+                user_returned=inputs.user_returned,
+            )
+        )
 
     def snapshot(self) -> Dict[str, Any]:
         return {

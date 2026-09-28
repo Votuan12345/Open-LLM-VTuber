@@ -19,15 +19,26 @@ from src.open_llm_vtuber.config_manager import (
 )
 from loguru import logger
 
-from src.open_llm_vtuber.pet_brain import BrainEvent, Mood
+from src.open_llm_vtuber.pet_brain import BrainEvent, Mood, PetBrain
 from src.open_llm_vtuber.pet_brain import context as context_module
 from src.open_llm_vtuber.pet_brain.context import (
+    ContextSnapshot,
     NullContextSensor,
     WindowsContextSensor,
     classify_process,
     idle_seconds_from_ticks,
 )
+from src.open_llm_vtuber.pet_brain.lifecycle import (
+    ACTIVE_TO_IDLE_S,
+    SLEEP_AT,
+    SLEEP_USER_IDLE_S,
+    SLEEPY_AT,
+    Lifecycle,
+    LifecycleInputs,
+    LifecyclePhase,
+)
 from src.open_llm_vtuber.pet_brain.mood import MOOD_KEYS, MoodState
+from src.open_llm_vtuber.pet_brain.pet_brain import BrainTickInputs
 from src.open_llm_vtuber.pet_brain.rhythm import (
     DayPart,
     day_part_at,
@@ -417,6 +428,256 @@ class ContextTests(unittest.TestCase):
     def test_windows_sensor_smoke(self):
         snap = WindowsContextSensor().sample()
         self.assertTrue(snap.user_idle_seconds is None or snap.user_idle_seconds >= 0)
+
+
+class LifecycleEvaluateTests(unittest.TestCase):
+    def _inputs(self, **overrides):
+        base = dict(
+            sleepiness=0.1,
+            user_idle_seconds=5.0,
+            quiet_seconds=0.0,
+            conversation_running=False,
+            away_after_seconds=600.0,
+            user_returned=False,
+        )
+        base.update(overrides)
+        return LifecycleInputs(**base)
+
+    def test_rule1_user_returned_wakes_from_away(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.AWAY
+        lc.evaluate(self._inputs(user_returned=True))
+        self.assertEqual(lc.phase, LifecyclePhase.ACTIVE)
+
+    def test_rule2_idle_over_threshold_goes_away(self):
+        for phase in (
+            LifecyclePhase.ACTIVE,
+            LifecyclePhase.IDLE,
+            LifecyclePhase.SLEEPY,
+        ):
+            lc = Lifecycle(clock=FakeMono())
+            lc.phase = phase
+            lc.evaluate(self._inputs(user_idle_seconds=600.0, away_after_seconds=600.0))
+            self.assertEqual(lc.phase, LifecyclePhase.AWAY, phase)
+
+    def test_rule2_does_not_fire_when_idle_unknown(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.ACTIVE
+        lc.evaluate(self._inputs(user_idle_seconds=None, away_after_seconds=600.0))
+        self.assertEqual(lc.phase, LifecyclePhase.ACTIVE)
+
+    def test_rule3_quiet_goes_idle(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.ACTIVE
+        lc.evaluate(self._inputs(quiet_seconds=ACTIVE_TO_IDLE_S))
+        self.assertEqual(lc.phase, LifecyclePhase.IDLE)
+
+    def test_rule3_blocked_by_running_conversation(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.ACTIVE
+        lc.evaluate(
+            self._inputs(quiet_seconds=ACTIVE_TO_IDLE_S, conversation_running=True)
+        )
+        self.assertEqual(lc.phase, LifecyclePhase.ACTIVE)
+
+    def test_rule4_idle_to_sleepy(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.IDLE
+        lc.evaluate(self._inputs(sleepiness=SLEEPY_AT))
+        self.assertEqual(lc.phase, LifecyclePhase.SLEEPY)
+
+    def test_rule5_sleepy_to_sleep(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.SLEEPY
+        lc.evaluate(
+            self._inputs(
+                sleepiness=SLEEP_AT,
+                user_idle_seconds=SLEEP_USER_IDLE_S,
+                away_after_seconds=SLEEP_USER_IDLE_S + 1,
+            )
+        )
+        self.assertEqual(lc.phase, LifecyclePhase.SLEEP)
+
+    def test_rule5_requires_known_idle(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.SLEEPY
+        lc.evaluate(self._inputs(sleepiness=SLEEP_AT, user_idle_seconds=None))
+        self.assertEqual(lc.phase, LifecyclePhase.SLEEPY)
+
+    def test_sleep_stays_sleep_with_user_returned(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.SLEEP
+        lc.evaluate(self._inputs(sleepiness=0.9, user_returned=True))
+        self.assertEqual(lc.phase, LifecyclePhase.SLEEP)
+
+    def test_sleep_leaves_only_via_ensure_active(self):
+        lc = Lifecycle(clock=FakeMono())
+        lc.phase = LifecyclePhase.SLEEP
+        lc.ensure_active("user_input")
+        self.assertEqual(lc.phase, LifecyclePhase.ACTIVE)
+
+
+class BrainTickTests(unittest.TestCase):
+    def _brain(self, wall_dt, config=None):
+        from src.open_llm_vtuber.config_manager import PetBrainConfig
+
+        mono = FakeMono()
+        wall = FakeWall(wall_dt)
+        brain = PetBrain(
+            config or PetBrainConfig(enabled=True), clock=mono, wall_clock=wall
+        )
+        return brain, mono, wall
+
+    def _ctx(self, wall, idle):
+        return ContextSnapshot(
+            taken_at_wall=wall.dt,
+            user_idle_seconds=idle,
+            process_name=None,
+            fullscreen=None,
+        )
+
+    def test_user_returned_applies_event_and_wakes_from_away(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0))
+        brain.lifecycle.phase = LifecyclePhase.AWAY
+        before_happiness = brain.mood._state.happiness
+        before_curiosity = brain.mood._state.curiosity
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 5.0),
+                category=None,
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=True,
+            )
+        )
+
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.ACTIVE)
+        self.assertAlmostEqual(
+            brain.mood._state.happiness, before_happiness + 0.05, places=6
+        )
+        self.assertAlmostEqual(
+            brain.mood._state.curiosity, before_curiosity + 0.05, places=6
+        )
+
+    def test_user_returned_stays_away_when_not_currently_away(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0))
+        brain.lifecycle.phase = LifecyclePhase.ACTIVE
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 5.0),
+                category=None,
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=True,
+            )
+        )
+
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.ACTIVE)
+
+    def test_running_conversation_blocks_active_to_idle(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0))
+        brain.lifecycle.phase = LifecyclePhase.ACTIVE
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 5.0),
+                category=None,
+                quiet_seconds=ACTIVE_TO_IDLE_S,
+                conversation_running=True,
+                user_returned=False,
+            )
+        )
+
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.ACTIVE)
+
+    def test_tick_uses_mood_updated_this_tick(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 23, 0))
+        brain.lifecycle.phase = LifecyclePhase.IDLE
+        brain.mood._state.sleepiness = 0.69
+
+        mono.t += 3600
+        wall.dt += timedelta(hours=1)
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 5.0),
+                category=None,
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=False,
+            )
+        )
+
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.SLEEPY)
+
+    def test_tick_sets_focus_flag_after_advance(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0))
+        focus_before = brain.mood._state.focus
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 10.0),
+                category="coding",
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=False,
+            )
+        )
+
+        self.assertTrue(brain.mood.focus_context_active)
+        focus_after_first_tick = brain.mood._state.focus
+        self.assertAlmostEqual(focus_after_first_tick, focus_before, places=6)
+
+        mono.t += 3600
+        wall.dt += timedelta(hours=1)
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 10.0),
+                category="coding",
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=False,
+            )
+        )
+
+        self.assertGreater(brain.mood._state.focus, focus_after_first_tick)
+
+    def test_focus_flag_false_when_idle_too_high(self):
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0))
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 200.0),
+                category="coding",
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=False,
+            )
+        )
+
+        self.assertFalse(brain.mood.focus_context_active)
+
+    def test_away_after_seconds_uses_config(self):
+        from src.open_llm_vtuber.config_manager import ContextConfig, PetBrainConfig
+
+        config = PetBrainConfig(enabled=True, context=ContextConfig(away_after_min=1.0))
+        brain, mono, wall = self._brain(datetime(2024, 1, 1, 13, 0), config=config)
+        brain.lifecycle.phase = LifecyclePhase.ACTIVE
+
+        brain.tick(
+            BrainTickInputs(
+                context=self._ctx(wall, 60.0),
+                category=None,
+                quiet_seconds=0.0,
+                conversation_running=False,
+                user_returned=False,
+            )
+        )
+
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.AWAY)
 
 
 if __name__ == "__main__":
