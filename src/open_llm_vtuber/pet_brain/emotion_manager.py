@@ -12,6 +12,7 @@ class EmotionSource(str, Enum):
     LLM_TAG = "llm_tag"
     FALLBACK_INVALID_EXPRESSION = "fallback_invalid_expression"
     EXPRESSION_ONLY = "expression_only"
+    IDLE_BEHAVIOR = "idle_behavior"
 
 
 class EmotionManager:
@@ -78,6 +79,20 @@ class EmotionManager:
 
         self._record_from(actions, accepted[-1])
         return actions
+
+    def apply_idle(self, name: str, live2d_model: Any) -> Optional[Actions]:
+        """Idle-behavior expression (spec §8.9): no LLM, no speech.
+
+        Missing keys never raise; they return `None` so nothing is sent.
+        The returned `Actions` carries no `emotion` metadata.
+        """
+        emo_map: Optional[Dict[str, Any]] = getattr(live2d_model, "emo_map", None)
+        if not emo_map or name not in emo_map:
+            logger.debug(f"[Emotion] idle expression '{name}' not in emotionMap")
+            return None
+        expression = emo_map[name]
+        self._record(name, expression, EmotionSource.IDLE_BEHAVIOR)
+        return Actions(expressions=[expression])
 
     @staticmethod
     def _filter(expressions: List[Any], emo_map: Dict[str, Any]):

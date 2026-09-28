@@ -10,13 +10,24 @@ websocket handler that constructs it.
 """
 
 import asyncio
+import functools
+import json
 import random
 import time
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from loguru import logger
 
-from .behavior import effective_min_interval_s
+from ..utils.stream_audio import prepare_audio_payload
+from .behavior import (
+    BehaviorKind,
+    BehaviorSelector,
+    Decision,
+    SelectionInput,
+    Trigger,
+    effective_min_interval_s,
+)
 from .context import (
     ContextSensor,
     ContextSnapshot,
@@ -25,8 +36,10 @@ from .context import (
 )
 from .eligibility import ClientEligibility
 from .events import BrainEvent
-from .pet_brain import BrainTickInputs, PetBrain
-from .presence import ClientPresence, SchedulerState
+from .pet_brain import ActivityState, BrainTickInputs, PetBrain
+from .presence import ClientPresence, SchedulerState, prune_window
+from .proactive_prompt import build_context_block
+from .rhythm import day_part_at
 
 # `user_returned` fires when the current known idle drops below this (spec §7.3).
 RETURNED_IDLE_BELOW_S = 30.0
@@ -49,6 +62,7 @@ class BehaviorScheduler:
         preempt_warn_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
         rng: Optional[random.Random] = None,
+        wall_clock: Callable[[], datetime] = datetime.now,
     ):
         self.client_connections = client_connections
         self.client_contexts = client_contexts
@@ -67,7 +81,9 @@ class BehaviorScheduler:
         self.tick_seconds = tick_seconds
         self.preempt_warn_seconds = preempt_warn_seconds
         self._clock = clock
+        self._wall_clock = wall_clock
         self.rng = rng if rng is not None else random.Random()
+        self.selector = BehaviorSelector(self.rng)
 
         self.presences: Dict[str, ClientPresence] = {}
         self.state = SchedulerState()
@@ -154,8 +170,11 @@ class BehaviorScheduler:
         # Label uses the most relevant handled client's brain table.
         first_uid = self.eligibility.order(handled, self.presences)[0]
         brain = self.eligibility.brain_for(first_uid)
+        if brain is None or not brain.config.context.enabled:
+            # Never log a process name for a brain whose context is disabled.
+            ctx = ContextSnapshot.unknown(ctx.taken_at_wall)
         category = None
-        if brain is not None and brain.config.context.enabled:
+        if brain is not None:
             category = classify_process(
                 ctx.process_name, brain.config.context.process_categories
             )
@@ -245,6 +264,227 @@ class BehaviorScheduler:
                 f"backoff={backoff_min:g}min"
             )
 
+    # ------------------------------------------------------------------
+    # Decision, commit and dispatch (spec §8.1, §8.5, §8.9, §8.10)
+    # ------------------------------------------------------------------
+
     async def _select_and_dispatch(self, now: float, ctx: ContextSnapshot) -> None:
-        """Decision and commit path; filled in by Task 9."""
-        return
+        # `now`/`ctx` are this tick's values; `evaluate_client` reads the same
+        # clock and `state.last_context` so TICK and REQUEST share one path.
+        handled = [uid for uid in self.presences if self.eligibility.handles(uid)]
+        allow_proactive = True
+        for uid in self.eligibility.order(handled, self.presences):
+            d = self.evaluate_client(uid, Trigger.TICK, allow_proactive=allow_proactive)
+            if d.kind is BehaviorKind.PROACTIVE_SPEAK:
+                # At most one proactive turn per tick in total (spec §8.2).
+                allow_proactive = False
+            elif d.kind is BehaviorKind.IDLE_EXPRESSION:
+                await self._dispatch_idle(uid, d.emotion)
+
+    def request_proactive(self, uid: str, images: Optional[list] = None) -> Decision:
+        """Legacy `ai-speak-signal` entry point (spec §8.1, §8.8). Synchronous."""
+
+        if images:
+            logger.debug(
+                f"[Behavior] discarded {len(images)} legacy proactive image(s)"
+            )
+        self.state.last_context = self.sensor.sample()
+        return self.evaluate_client(uid, Trigger.REQUEST)
+
+    def evaluate_client(
+        self, uid: str, trigger: Trigger, *, allow_proactive: bool = True
+    ) -> Decision:
+        """The only decision path for both TICK and REQUEST.
+
+        Synchronous on purpose: there is no `await` between the eligibility
+        check and the proactive task creation (spec §8.5). With
+        `allow_proactive=False` a PROACTIVE_SPEAK selection is turned into
+        `DO_NOTHING (proactive_slot_taken)` without committing.
+        """
+
+        d = self._decide(uid, trigger, allow_proactive)
+        message = (
+            f"[Behavior] uid={uid} trigger={trigger.value} → {d.kind.name} ({d.reason})"
+        )
+        if trigger is Trigger.REQUEST or d.kind is not BehaviorKind.DO_NOTHING:
+            logger.info(message)
+        else:
+            logger.debug(message)
+        return d
+
+    def _decide(self, uid: str, trigger: Trigger, allow_proactive: bool) -> Decision:
+        now = self._clock()
+        presence = self.presences.get(uid)
+        reason = self.eligibility.check(uid, presence)
+        if reason is not None:
+            return Decision(BehaviorKind.DO_NOTHING, reason)
+        if presence is None:
+            return Decision(BehaviorKind.DO_NOTHING, "not_connected")
+
+        brain = self.eligibility.brain_for(uid)
+        last = self.state.last_context
+        if last is None or not brain.config.context.enabled:
+            wall = last.taken_at_wall if last is not None else self._wall_clock()
+            ctx = ContextSnapshot.unknown(wall)
+        else:
+            ctx = last
+        category = classify_process(
+            ctx.process_name, brain.config.context.process_categories
+        )
+
+        live2d_model = getattr(self.client_contexts.get(uid), "live2d_model", None)
+        emo_map = getattr(live2d_model, "emo_map", None) or {}
+        mood = brain.mood.snapshot()
+
+        d = self.selector.select(
+            SelectionInput(
+                trigger=trigger,
+                now=now,
+                presence=presence,
+                activity=brain.activity,
+                lifecycle=brain.lifecycle.phase,
+                mood=mood,
+                context=ctx,
+                category=category,
+                config=brain.config,
+                emo_map=emo_map,
+            )
+        )
+
+        returned_after_s = None
+        if d.willingness is not None:
+            # The returned bonus is consumed either way (spec §8.4); keep its
+            # value for the prompt before clearing it.
+            if presence.returned_bonus_pending:
+                returned_after_s = presence.returned_after_s
+            presence.returned_bonus_pending = False
+            presence.returned_after_s = None
+
+        if d.kind is BehaviorKind.PROACTIVE_SPEAK:
+            if not allow_proactive:
+                return Decision(BehaviorKind.DO_NOTHING, "proactive_slot_taken")
+            committed = self._commit_proactive(
+                uid,
+                brain,
+                presence,
+                ctx,
+                category,
+                trigger,
+                d.willingness,
+                mood,
+                returned_after_s,
+                now,
+            )
+            if not committed:
+                return Decision(BehaviorKind.DO_NOTHING, "conversation_lock")
+        return d
+
+    def _commit_proactive(
+        self,
+        uid: str,
+        brain: PetBrain,
+        presence: ClientPresence,
+        ctx: ContextSnapshot,
+        category: Optional[str],
+        trigger: Trigger,
+        willingness: Optional[float],
+        mood: Dict[str, float],
+        returned_after_s: Optional[float],
+        now: float,
+    ) -> bool:
+        """Atomic commit (spec §8.5). Synchronous: no `await` in here."""
+
+        if (
+            self.eligibility.check(uid, presence) is not None
+            or brain.activity != ActivityState.IDLE
+        ):
+            return False
+
+        presence.reserved = True
+        presence.last_proactive = now
+        prune_window(presence.proactive_timestamps, now)
+        presence.proactive_timestamps.append(now)
+        presence.proactive_preempted = False
+
+        block = build_context_block(
+            now_wall=ctx.taken_at_wall,
+            day_part=day_part_at(ctx.taken_at_wall),
+            lifecycle=brain.lifecycle.phase,
+            mood=mood,
+            category=category,
+            process_name=ctx.process_name,
+            user_idle_seconds=ctx.user_idle_seconds,
+            returned_after_s=returned_after_s,
+            trigger=trigger,
+        )
+
+        context = self.client_contexts[uid]
+        websocket = self.client_connections[uid]
+        task = asyncio.create_task(
+            self._run_proactive_turn(context, websocket.send_text, uid, block)
+        )
+        self.current_conversation_tasks[uid] = task
+        presence.proactive_task = task
+        task.add_done_callback(functools.partial(self._on_proactive_done, uid, brain))
+
+        w = f"{willingness:.2f}" if willingness is not None else "None"
+        logger.info(
+            f"[Proactive] committed uid={uid} willingness={w} "
+            f"category={category}({ctx.process_name})"
+        )
+        return True
+
+    def _on_proactive_done(self, uid: str, brain: PetBrain, task: asyncio.Task) -> None:
+        error = None if task.cancelled() else task.exception()
+        presence = self.presences.get(uid)
+        if presence is None or presence.proactive_task is not task:
+            # Client disconnected (or reconnected with a fresh presence).
+            return
+
+        presence.reserved = False
+        presence.proactive_task = None
+        presence.last_conversation_end = self._clock()
+
+        if error is not None:
+            logger.debug(f"[Proactive] turn ended with error uid={uid}: {error!r}")
+        normal = (
+            not task.cancelled() and error is None and not presence.proactive_preempted
+        )
+        presence.proactive_preempted = False
+        if normal:
+            presence.awaiting_reply_since = self._clock()
+            brain.notify(BrainEvent.PROACTIVE_SPOKEN)
+
+    async def _dispatch_idle(self, uid: str, emotion: Optional[str]) -> None:
+        """Send an expression-only payload to this client (spec §8.9).
+
+        Never touches the lifecycle lock or connect/disconnect paths; a send
+        failure (closed websocket) is logged and swallowed so it never breaks
+        the tick.
+        """
+
+        brain = self.eligibility.brain_for(uid)
+        context = self.client_contexts.get(uid)
+        websocket = self.client_connections.get(uid)
+        if brain is None or context is None or websocket is None or emotion is None:
+            return
+        actions = brain.emotion.apply_idle(
+            emotion, getattr(context, "live2d_model", None)
+        )
+        if actions is None:
+            return
+
+        now = self._clock()
+        presence = self.presences.get(uid)
+        if presence is not None:
+            presence.last_idle_expression = now
+            prune_window(presence.idle_expression_timestamps, now)
+            presence.idle_expression_timestamps.append(now)
+
+        payload = prepare_audio_payload(
+            audio_path=None, display_text=None, actions=actions
+        )
+        try:
+            await websocket.send_text(json.dumps(payload))
+        except Exception as e:
+            logger.debug(f"[Behavior] idle expression send failed uid={uid}: {e}")

@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import json
 import random
 import sys
 import unittest
@@ -36,6 +37,10 @@ from src.open_llm_vtuber.pet_brain.behavior import (
     willingness,
 )
 from src.open_llm_vtuber.pet_brain.eligibility import ClientEligibility
+from src.open_llm_vtuber.pet_brain.emotion_manager import (
+    EmotionManager,
+    EmotionSource,
+)
 from src.open_llm_vtuber.pet_brain.proactive_prompt import build_context_block
 from src.open_llm_vtuber.pet_brain.context import (
     ContextSnapshot,
@@ -1787,6 +1792,621 @@ class TickPipelineTests(unittest.IsolatedAsyncioTestCase):
         await sched.client_connected("a")
         self.assertEqual(sched.presences["a"].connected_at, 42.0)
         await sched.client_disconnected("a")
+
+
+HIGH_MOOD = MoodState(
+    happiness=0.5,
+    energy=1.0,
+    curiosity=0.5,
+    boredom=0.9,
+    social_need=0.9,
+    focus=0.3,
+    sleepiness=0.0,
+)
+
+
+class ProactiveStub:
+    """Injected `run_proactive_turn`; records calls, optionally blocks or raises."""
+
+    def __init__(self, block=False, error=None):
+        self.calls = []
+        self.release = asyncio.Event()
+        self.block = block
+        self.error = error
+
+    async def __call__(self, context, websocket_send, client_uid, context_block):
+        self.calls.append((context, websocket_send, client_uid, context_block))
+        if self.block:
+            await self.release.wait()
+        if self.error is not None:
+            raise self.error
+
+
+def make_behavior_scheduler(
+    uids=("a",),
+    brains=None,
+    stub=None,
+    idle_expression=False,
+    emo_map=None,
+    mono=None,
+):
+    """Scheduler with a high-willingness brain, rng stub 0.0 and a browser sensor."""
+
+    mono = mono or FakeMono(100_000.0)
+    if brains is None:
+        shared = make_real_brain(mono, away_after_min=30.0)
+        brains = {uid: shared for uid in uids}
+    for brain in {id(b): b for b in brains.values() if b is not None}.values():
+        brain.mood = Mood(
+            initial=MoodState(**vars(HIGH_MOOD)),
+            clock=mono,
+            wall_clock=FakeWall(_SCHED_WALL),
+        )
+        brain.config.idle_expression.enabled = idle_expression
+    sensor = FakeSensor(_snapshot(idle=600.0, process="chrome.exe"))
+    sched, connections, contexts, tasks = make_scheduler(
+        uids=uids, brains=brains, sensor=sensor, clock=mono
+    )
+    if emo_map is not None:
+        for ctx in contexts.values():
+            ctx.live2d_model.emo_map = dict(emo_map)
+    stub = stub or ProactiveStub()
+    sched._run_proactive_turn = stub
+    sched.selector = BehaviorSelector(rng=_FixedRandom(0.0))
+    for uid in uids:
+        sched.presences[uid] = ClientPresence(uid=uid, connected_at=0.0)
+    return sched, stub, connections, contexts, tasks, mono
+
+
+async def _drain(task):
+    try:
+        await task
+    except BaseException:
+        pass
+    await asyncio.sleep(0)
+
+
+class _CreateTaskCounter:
+    """Counts `asyncio.create_task` calls made from inside the scheduler module."""
+
+    def __init__(self):
+        self.count = 0
+        self._real = asyncio.create_task
+
+    def __call__(self, coro, *args, **kwargs):
+        self.count += 1
+        return self._real(coro, *args, **kwargs)
+
+
+class EvaluatePathTests(unittest.IsolatedAsyncioTestCase):
+    def test_decision_path_is_synchronous(self):
+        for name in ("evaluate_client", "request_proactive", "_commit_proactive"):
+            self.assertFalse(
+                inspect.iscoroutinefunction(getattr(BehaviorScheduler, name)), name
+            )
+
+    async def test_tick_commits_one_proactive(self):
+        stub = ProactiveStub(block=True)
+        sched, _, connections, contexts, tasks, _ = make_behavior_scheduler(stub=stub)
+        await sched.tick_once()
+        await asyncio.sleep(0)
+        self.assertEqual(len(stub.calls), 1)
+        context, send, uid, block = stub.calls[0]
+        self.assertIs(context, contexts["a"])
+        self.assertEqual(send, connections["a"].send_text)
+        self.assertEqual(uid, "a")
+        self.assertIn("browser (chrome.exe)", block)
+        self.assertIn("you chose to", block)
+        presence = sched.presences["a"]
+        task = tasks["a"]
+        self.assertIs(presence.proactive_task, task)
+        self.assertTrue(presence.reserved)
+        self.assertEqual(presence.last_proactive, 100_000.0)
+        self.assertEqual(list(presence.proactive_timestamps), [100_000.0])
+        stub.release.set()
+        await _drain(task)
+        self.assertFalse(presence.reserved)
+        self.assertIsNone(presence.proactive_task)
+
+    async def test_commit_logs_committed_line(self):
+        sched, _, _, _, tasks, _ = make_behavior_scheduler()
+        with _LoguruCapture(level="INFO") as records:
+            d = sched.request_proactive("a")
+        self.assertIs(d.kind, BehaviorKind.PROACTIVE_SPEAK)
+        self.assertTrue(
+            any(
+                "[Proactive] committed uid=a willingness=" in r
+                and "category=browser(chrome.exe)" in r
+                for r in records
+            ),
+            records,
+        )
+        self.assertTrue(
+            any("[Behavior] uid=a trigger=request" in r for r in records), records
+        )
+        await _drain(tasks["a"])
+
+    async def test_request_refused_under_cooldown_sends_nothing(self):
+        sched, stub, connections, _, tasks, mono = make_behavior_scheduler()
+        sched.presences["a"].last_proactive = mono() - 60
+        d = sched.request_proactive("a")
+        self.assertEqual((d.kind, d.reason), (BehaviorKind.DO_NOTHING, "cooldown"))
+        await asyncio.sleep(0)
+        self.assertEqual(connections["a"].messages, [])
+        self.assertEqual(stub.calls, [])
+        self.assertNotIn("a", tasks)
+
+    async def test_request_refusal_logged_at_info(self):
+        sched, _, _, _, _, mono = make_behavior_scheduler()
+        sched.presences["a"].last_proactive = mono() - 60
+        with _LoguruCapture(level="INFO") as records:
+            sched.request_proactive("a")
+        self.assertTrue(
+            any(
+                "[Behavior] uid=a trigger=request" in r and "(cooldown)" in r
+                for r in records
+            ),
+            records,
+        )
+
+    async def test_tick_do_nothing_logged_at_debug_only(self):
+        sched, _, _, _, _, mono = make_behavior_scheduler()
+        sched.presences["a"].last_proactive = mono() - 60
+        with _LoguruCapture(level="INFO") as records:
+            await sched.tick_once()
+        self.assertFalse(any("[Behavior] uid=a" in r for r in records), records)
+        with _LoguruCapture(level="DEBUG") as records:
+            await sched.tick_once()
+        self.assertTrue(
+            any(
+                "[Behavior] uid=a trigger=tick" in r and "(cooldown)" in r
+                for r in records
+            ),
+            records,
+        )
+
+    def _gate_setups(self):
+        def lock(sched, brain, presence, now):
+            brain.activity = ActivityState.TALKING
+
+        def hourly_cap(sched, brain, presence, now):
+            presence.last_proactive = now - 15 * 60
+            presence.proactive_timestamps.extend(
+                [now - 50 * 60, now - 30 * 60, now - 15 * 60]
+            )
+
+        def low_willingness(sched, brain, presence, now):
+            brain.mood = Mood(
+                initial=MoodState(social_need=0.0, boredom=0.0, curiosity=0.0),
+                clock=sched._clock,
+                wall_clock=FakeWall(_SCHED_WALL),
+            )
+
+        def sleep(sched, brain, presence, now):
+            brain.lifecycle.phase = LifecyclePhase.SLEEP
+
+        return {
+            "conversation_lock": lock,
+            "hourly_cap": hourly_cap,
+            "low_willingness": low_willingness,
+            "lifecycle_sleep": sleep,
+        }
+
+    async def test_request_and_tick_share_gates(self):
+        for expected, setup in self._gate_setups().items():
+            reasons = {}
+            for trigger in (Trigger.TICK, Trigger.REQUEST):
+                sched, stub, *_ = make_behavior_scheduler()
+                sched.state.last_context = sched.sensor.sample()
+                brain = sched.eligibility.brain_for("a")
+                setup(sched, brain, sched.presences["a"], sched._clock())
+                d = sched.evaluate_client("a", trigger)
+                self.assertIs(d.kind, BehaviorKind.DO_NOTHING, (expected, trigger))
+                reasons[trigger] = d.reason
+                self.assertEqual(stub.calls, [])
+            self.assertEqual(reasons[Trigger.TICK], expected)
+            self.assertEqual(reasons[Trigger.REQUEST], expected)
+
+    async def test_legacy_timer_spam_refused(self):
+        counter = _CreateTaskCounter()
+        sched, stub, connections, _, tasks, _ = make_behavior_scheduler()
+        with mock.patch.object(scheduler_module.asyncio, "create_task", counter):
+            first = sched.request_proactive("a")
+            self.assertIs(first.kind, BehaviorKind.PROACTIVE_SPEAK)
+            decisions = [sched.request_proactive("a") for _ in range(10)]
+        self.assertTrue(all(d.kind is BehaviorKind.DO_NOTHING for d in decisions))
+        await _drain(tasks["a"])
+        with mock.patch.object(scheduler_module.asyncio, "create_task", counter):
+            decisions = [sched.request_proactive("a") for _ in range(10)]
+        self.assertTrue(all(d.kind is BehaviorKind.DO_NOTHING for d in decisions))
+        self.assertEqual({d.reason for d in decisions}, {"cooldown"})
+        self.assertEqual(counter.count, 1)
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(connections["a"].messages, [])
+
+    async def test_images_discarded(self):
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler()
+        images = [{"source": "screen", "data": "xxx", "mime_type": "image/png"}]
+        with _LoguruCapture(level="DEBUG") as records:
+            sched.request_proactive("a", images=images)
+        await _drain(tasks["a"])
+        self.assertEqual(len(stub.calls), 1)
+        for arg in stub.calls[0]:
+            self.assertIsNot(arg, images)
+        self.assertNotIn("xxx", stub.calls[0][3])
+        self.assertTrue(
+            any(
+                "[Behavior] discarded 1 legacy proactive image(s)" in r for r in records
+            ),
+            records,
+        )
+
+    async def test_request_refreshes_context_synchronously(self):
+        sched, _, _, _, tasks, _ = make_behavior_scheduler()
+        self.assertIsNone(sched.state.last_context)
+        sched.request_proactive("a")
+        self.assertEqual(sched.sensor.calls, 1)
+        self.assertIs(sched.state.last_context, sched.sensor.snapshot)
+        await _drain(tasks["a"])
+        self.assertIn("the app asked you to", sched._run_proactive_turn.calls[0][3])
+
+    async def test_returned_bonus_consumed_and_in_prompt(self):
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler()
+        presence = sched.presences["a"]
+        presence.returned_bonus_pending = True
+        presence.returned_after_s = 1800.0
+        sched.request_proactive("a")
+        await _drain(tasks["a"])
+        self.assertIn("came back after 30 min", stub.calls[0][3])
+        self.assertFalse(presence.returned_bonus_pending)
+        self.assertIsNone(presence.returned_after_s)
+
+    async def test_returned_bonus_consumed_when_refused_by_willingness(self):
+        sched, stub, *_ = make_behavior_scheduler()
+        sched.selector = BehaviorSelector(rng=_FixedRandom(0.99))
+        presence = sched.presences["a"]
+        presence.returned_bonus_pending = True
+        presence.returned_after_s = 900.0
+        d = sched.request_proactive("a")
+        self.assertEqual(d.reason, "chance")
+        self.assertFalse(presence.returned_bonus_pending)
+        self.assertEqual(stub.calls, [])
+
+    async def test_context_disabled_brain_evaluates_unknown(self):
+        sched, stub, *_ = make_behavior_scheduler()
+        sched.eligibility.brain_for("a").config.context.enabled = False
+        d = sched.request_proactive("a")
+        self.assertEqual(
+            (d.kind, d.reason), (BehaviorKind.DO_NOTHING, "context_unknown")
+        )
+
+    async def test_missing_presence_does_nothing(self):
+        sched, stub, *_ = make_behavior_scheduler()
+        del sched.presences["a"]
+        d = sched.request_proactive("a")
+        self.assertIs(d.kind, BehaviorKind.DO_NOTHING)
+        self.assertEqual(stub.calls, [])
+
+
+class RaceTests(unittest.IsolatedAsyncioTestCase):
+    async def _run_race(self, request_first):
+        counter = _CreateTaskCounter()
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler()
+
+        async def req():
+            return sched.request_proactive("a")
+
+        with mock.patch.object(scheduler_module.asyncio, "create_task", counter):
+            if request_first:
+                await asyncio.gather(req(), sched.tick_once())
+            else:
+                await asyncio.gather(sched.tick_once(), req())
+            await _drain(tasks["a"])
+        self.assertEqual(len(stub.calls), 1)
+        self.assertEqual(counter.count, 1)
+
+    async def test_request_then_tick_same_iteration_one_task(self):
+        await self._run_race(request_first=True)
+
+    async def test_tick_then_request_one_task(self):
+        await self._run_race(request_first=False)
+
+    async def test_recheck_sees_reserved(self):
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler()
+        original = sched.selector.select
+
+        def _select(inp):
+            d = original(inp)
+            sched.presences["a"].reserved = True
+            return d
+
+        sched.selector.select = _select
+        d = sched.request_proactive("a")
+        self.assertEqual(
+            (d.kind, d.reason), (BehaviorKind.DO_NOTHING, "conversation_lock")
+        )
+        await asyncio.sleep(0)
+        self.assertEqual(stub.calls, [])
+        self.assertNotIn("a", tasks)
+        self.assertIsNone(sched.presences["a"].last_proactive)
+
+    async def test_recheck_sees_activity_not_idle(self):
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler()
+        original = sched.selector.select
+        brain = sched.eligibility.brain_for("a")
+
+        def _select(inp):
+            d = original(inp)
+            brain.activity = ActivityState.THINKING
+            return d
+
+        sched.selector.select = _select
+        d = sched.request_proactive("a")
+        self.assertEqual(d.reason, "conversation_lock")
+        self.assertNotIn("a", tasks)
+
+    async def test_switch_config_follows_new_brain(self):
+        sched, stub, _, contexts, tasks, mono = make_behavior_scheduler()
+        old = contexts["a"].pet_brain
+        new = make_real_brain(mono, away_after_min=30.0)
+        new.config.idle_expression.enabled = False
+        old_calls = wrap_tick(old)
+        new_calls = wrap_tick(new)
+        contexts["a"].pet_brain = new
+        sched.presences["a"].last_proactive = mono() - 60
+        await sched.tick_once()
+        self.assertEqual((len(old_calls), len(new_calls)), (0, 1))
+        contexts["a"].pet_brain = None
+        await sched.tick_once()
+        self.assertEqual((len(old_calls), len(new_calls)), (0, 1))
+        self.assertEqual(sched.request_proactive("a").reason, "not_handled")
+        self.assertEqual(stub.calls, [])
+
+    async def test_client_a_does_not_affect_client_b(self):
+        sched, stub, _, _, tasks, mono = make_behavior_scheduler(uids=("a", "b"))
+        a = sched.presences["a"]
+        a.last_proactive = mono() - 60
+        before = (
+            a.last_proactive,
+            list(a.proactive_timestamps),
+            a.reserved,
+            a.last_conversation_end,
+            a.awaiting_reply_since,
+        )
+        seen = {}
+        original = sched.evaluate_client
+
+        def _spy(uid, trigger, **kwargs):
+            d = original(uid, trigger, **kwargs)
+            seen[uid] = d
+            return d
+
+        sched.evaluate_client = _spy
+        await sched.tick_once()
+        self.assertEqual(
+            (seen["a"].kind, seen["a"].reason), (BehaviorKind.DO_NOTHING, "cooldown")
+        )
+        self.assertIs(seen["b"].kind, BehaviorKind.PROACTIVE_SPEAK)
+        await _drain(tasks["b"])
+        self.assertEqual([c[2] for c in stub.calls], ["b"])
+        self.assertNotIn("a", tasks)
+        self.assertEqual(
+            before,
+            (
+                a.last_proactive,
+                list(a.proactive_timestamps),
+                a.reserved,
+                a.last_conversation_end,
+                a.awaiting_reply_since,
+            ),
+        )
+
+    async def test_at_most_one_proactive_per_tick(self):
+        mono = FakeMono(100_000.0)
+        brains = {
+            "a": make_real_brain(mono, away_after_min=30.0),
+            "b": make_real_brain(mono, away_after_min=30.0),
+        }
+        sched, stub, _, _, tasks, _ = make_behavior_scheduler(
+            uids=("a", "b"), brains=brains, mono=mono
+        )
+        sched.presences["b"].last_user_interaction = mono() - 3600
+        seen = {}
+        original = sched.evaluate_client
+
+        def _spy(uid, trigger, **kwargs):
+            d = original(uid, trigger, **kwargs)
+            seen[uid] = d
+            return d
+
+        sched.evaluate_client = _spy
+        await sched.tick_once()
+        self.assertIs(seen["b"].kind, BehaviorKind.PROACTIVE_SPEAK)
+        self.assertEqual(
+            (seen["a"].kind, seen["a"].reason),
+            (BehaviorKind.DO_NOTHING, "proactive_slot_taken"),
+        )
+        self.assertNotIn("a", tasks)
+        self.assertIsNone(sched.presences["a"].last_proactive)
+        await _drain(tasks["b"])
+        self.assertEqual(len(stub.calls), 1)
+
+    async def test_disconnect_connect_race_keeps_loop(self):
+        sched, *_ = make_scheduler(uids=("a", "b"))
+        await sched.client_connected("a")
+        await sched.tick_once()
+        await asyncio.gather(
+            sched.client_disconnected("a"), sched.client_connected("b")
+        )
+        self.assertTrue(sched.is_running)
+        self.assertEqual(set(sched.presences), {"b"})
+        await sched.client_disconnected("b")
+
+    async def test_context_label_hidden_when_context_disabled(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono, context_enabled=False)
+        sched, *_ = make_scheduler(
+            brains={"a": brain},
+            sensor=FakeSensor(_snapshot(process="Code.exe")),
+            clock=mono,
+        )
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=0.0)
+        with _LoguruCapture(level="DEBUG") as records:
+            await sched.tick_once()
+        self.assertFalse(any("Code.exe" in r for r in records), records)
+        self.assertFalse(
+            any("[Context]" in r and "coding" in r for r in records), records
+        )
+
+
+class ProactiveDoneCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_normal_completion_sets_awaiting_and_spoken(self):
+        sched, stub, _, _, tasks, mono = make_behavior_scheduler()
+        brain = sched.eligibility.brain_for("a")
+        social_before = brain.mood.snapshot()["social_need"]
+        sched.request_proactive("a")
+        mono.t += 30
+        await _drain(tasks["a"])
+        presence = sched.presences["a"]
+        self.assertEqual(presence.awaiting_reply_since, mono())
+        self.assertEqual(presence.last_conversation_end, mono())
+        self.assertFalse(presence.reserved)
+        self.assertIsNone(presence.proactive_task)
+        self.assertLess(brain.mood.snapshot()["social_need"], social_before)
+
+    async def test_error_completion_no_awaiting(self):
+        stub = ProactiveStub(error=RuntimeError("boom"))
+        sched, _, _, _, tasks, mono = make_behavior_scheduler(stub=stub)
+        brain = sched.eligibility.brain_for("a")
+        social_before = brain.mood.snapshot()["social_need"]
+        sched.request_proactive("a")
+        with _LoguruCapture(level="DEBUG"):
+            await _drain(tasks["a"])
+        presence = sched.presences["a"]
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertEqual(presence.last_conversation_end, mono())
+        self.assertFalse(presence.reserved)
+        self.assertEqual(brain.mood.snapshot()["social_need"], social_before)
+        self.assertEqual(presence.last_proactive, mono())
+
+    async def test_cancelled_completion_no_awaiting(self):
+        stub = ProactiveStub(block=True)
+        sched, _, _, _, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        await asyncio.sleep(0)
+        tasks["a"].cancel()
+        await _drain(tasks["a"])
+        presence = sched.presences["a"]
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertFalse(presence.reserved)
+        self.assertIsNone(presence.proactive_task)
+
+    async def test_preempted_completion_no_awaiting_and_flag_reset(self):
+        sched, _, _, _, tasks, _ = make_behavior_scheduler()
+        sched.request_proactive("a")
+        presence = sched.presences["a"]
+        presence.proactive_preempted = True
+        await _drain(tasks["a"])
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertFalse(presence.proactive_preempted)
+
+    async def test_presence_gone_is_tolerated(self):
+        stub = ProactiveStub(block=True)
+        sched, _, _, _, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        await asyncio.sleep(0)
+        del sched.presences["a"]
+        stub.release.set()
+        await tasks["a"]
+        await asyncio.sleep(0)
+        self.assertNotIn("a", sched.presences)
+
+    async def test_stale_callback_does_not_touch_new_presence(self):
+        stub = ProactiveStub(block=True)
+        sched, _, _, _, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        await asyncio.sleep(0)
+        fresh = ClientPresence(uid="a", connected_at=0.0)
+        sched.presences["a"] = fresh
+        stub.release.set()
+        await _drain(tasks["a"])
+        self.assertIsNone(fresh.awaiting_reply_since)
+        self.assertIsNone(fresh.last_conversation_end)
+
+
+class _FailingWS:
+    async def send_text(self, message):
+        raise RuntimeError("websocket closed")
+
+
+class IdleDispatchTests(unittest.IsolatedAsyncioTestCase):
+    def test_apply_idle_records_and_returns_actions(self):
+        mono = FakeMono(5.0)
+        manager = EmotionManager(clock=mono)
+        model = SimpleNamespace(emo_map={"sleepy": 5, "neutral": 0})
+        actions = manager.apply_idle("sleepy", model)
+        self.assertEqual(actions.expressions, [5])
+        self.assertIsNone(actions.emotion)
+        self.assertEqual(manager.current_emotion, "sleepy")
+        self.assertEqual(manager.current_expression, 5)
+        self.assertIs(manager.current_emotion_source, EmotionSource.IDLE_BEHAVIOR)
+        self.assertEqual(EmotionSource.IDLE_BEHAVIOR.value, "idle_behavior")
+        self.assertEqual(manager.updated_at, 5.0)
+
+    def test_apply_idle_missing_key_returns_none(self):
+        manager = EmotionManager()
+        self.assertIsNone(manager.apply_idle("bored", SimpleNamespace(emo_map={})))
+        self.assertIsNone(manager.apply_idle("bored", None))
+        self.assertIsNone(manager.current_emotion_source)
+
+    async def test_dispatch_sends_expression_only_payload(self):
+        sched, _, connections, _, _, mono = make_behavior_scheduler(
+            emo_map={"sleepy": 5, "neutral": 0}
+        )
+        await sched._dispatch_idle("a", "sleepy")
+        self.assertEqual(len(connections["a"].messages), 1)
+        payload = json.loads(connections["a"].messages[0])
+        self.assertEqual(payload["type"], "audio")
+        self.assertIsNone(payload["audio"])
+        self.assertIsNone(payload["display_text"])
+        self.assertEqual(payload["actions"], {"expressions": [5]})
+        self.assertNotIn("emotion", payload["actions"])
+        brain = sched.eligibility.brain_for("a")
+        self.assertEqual(brain.emotion.current_emotion_source.value, "idle_behavior")
+        presence = sched.presences["a"]
+        self.assertEqual(presence.last_idle_expression, mono())
+        self.assertEqual(list(presence.idle_expression_timestamps), [mono()])
+        self.assertFalse(presence.reserved)
+
+    async def test_dispatch_missing_key_sends_nothing(self):
+        sched, _, connections, _, _, _ = make_behavior_scheduler(emo_map={"neutral": 0})
+        await sched._dispatch_idle("a", "bored")
+        self.assertEqual(connections["a"].messages, [])
+        self.assertIsNone(sched.presences["a"].last_idle_expression)
+
+    async def test_dispatch_send_failure_is_swallowed(self):
+        sched, _, connections, _, _, _ = make_behavior_scheduler(emo_map={"sleepy": 5})
+        connections["a"] = _FailingWS()
+        with _LoguruCapture(level="DEBUG") as records:
+            await sched._dispatch_idle("a", "sleepy")
+        self.assertTrue(
+            any("[Behavior]" in r and "websocket closed" in r for r in records),
+            records,
+        )
+
+    async def test_tick_dispatches_idle_expression(self):
+        mono = FakeMono(100_000.0)
+        brain = make_real_brain(mono, away_after_min=30.0)
+        brain.config.proactive.enabled = False
+        sched, stub, connections, _, tasks, _ = make_behavior_scheduler(
+            brains={"a": brain}, idle_expression=True, emo_map={"bored": 7}, mono=mono
+        )
+        await sched.tick_once()
+        self.assertEqual(stub.calls, [])
+        self.assertNotIn("a", tasks)
+        self.assertEqual(len(connections["a"].messages), 1)
+        payload = json.loads(connections["a"].messages[0])
+        self.assertEqual(payload["actions"], {"expressions": [7]})
 
 
 class PetBrainExportsTests(unittest.TestCase):
