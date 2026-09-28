@@ -1,5 +1,6 @@
 """Phase 2 behavior tests. Run from repo root: uv run python -m unittest tests.test_behavior_phase2 -v"""
 
+import asyncio
 import inspect
 import random
 import sys
@@ -7,6 +8,7 @@ import unittest
 from collections import deque
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest import mock
 
 from pydantic import ValidationError
 
@@ -53,7 +55,9 @@ from src.open_llm_vtuber.pet_brain.lifecycle import (
 )
 from src.open_llm_vtuber.pet_brain.mood import MOOD_KEYS, MoodState
 from src.open_llm_vtuber.pet_brain.pet_brain import ActivityState, BrainTickInputs
-from src.open_llm_vtuber.pet_brain.presence import ClientPresence
+from src.open_llm_vtuber.pet_brain.presence import ClientPresence, prune_window
+from src.open_llm_vtuber.pet_brain import scheduler as scheduler_module
+from src.open_llm_vtuber.pet_brain.scheduler import BehaviorScheduler
 from src.open_llm_vtuber.pet_brain.rhythm import (
     DayPart,
     day_part_at,
@@ -1385,6 +1389,421 @@ class ProactiveContextBlockTests(unittest.TestCase):
             block = build_context_block(**kwargs)
             self.assertNotIn("window", block.lower())
             self.assertNotIn("title", block.lower())
+
+
+class FakeSensor:
+    """Returns a fixed snapshot and counts `sample()` calls."""
+
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+        self.calls = 0
+
+    def sample(self):
+        self.calls += 1
+        return self.snapshot
+
+
+class FakeWS:
+    def __init__(self):
+        self.messages = []
+
+    async def send_text(self, message):
+        self.messages.append(message)
+
+
+class _NoGroupManager:
+    def get_client_group(self, uid):
+        return None
+
+
+async def _noop_proactive_turn(context, websocket_send, client_uid, context_block):
+    return None
+
+
+_SCHED_WALL = datetime(2024, 6, 15, 10, 0)
+
+
+def _snapshot(idle=5.0, process="Code.exe", fullscreen=False):
+    return ContextSnapshot(
+        taken_at_wall=_SCHED_WALL,
+        user_idle_seconds=idle,
+        process_name=process,
+        fullscreen=fullscreen,
+    )
+
+
+def make_real_brain(mono, context_enabled=True, away_after_min=10.0):
+    cfg = PetBrainConfig(enabled=True)
+    cfg.context.enabled = context_enabled
+    cfg.context.away_after_min = away_after_min
+    return PetBrain(cfg, clock=mono, wall_clock=FakeWall(_SCHED_WALL))
+
+
+def wrap_tick(brain):
+    """Record every BrainTickInputs passed to `brain.tick`, still calling it."""
+
+    calls = []
+    original = brain.tick
+
+    def _tick(inputs):
+        calls.append(inputs)
+        original(inputs)
+
+    brain.tick = _tick
+    return calls
+
+
+def make_scheduler(
+    uids=("a",),
+    brains=None,
+    sensor=None,
+    clock=None,
+    tick_seconds=20.0,
+    cls=None,
+):
+    clock = clock or FakeMono()
+    if brains is None:
+        shared = make_real_brain(clock)
+        brains = {uid: shared for uid in uids}
+    connections = {uid: FakeWS() for uid in uids}
+    contexts = {
+        uid: SimpleNamespace(
+            pet_brain=brains[uid],
+            live2d_model=SimpleNamespace(emo_map={"joy": 3, "neutral": 0}),
+        )
+        for uid in uids
+    }
+    tasks = {}
+    cls = cls or BehaviorScheduler
+    sched = cls(
+        connections,
+        contexts,
+        tasks,
+        _NoGroupManager(),
+        run_proactive_turn=_noop_proactive_turn,
+        sensor=sensor or FakeSensor(_snapshot()),
+        tick_seconds=tick_seconds,
+        clock=clock,
+        rng=random.Random(0),
+    )
+    return sched, connections, contexts, tasks
+
+
+class PruneWindowTests(unittest.TestCase):
+    def test_drops_old_keeps_new(self):
+        ts = deque([100.0, 200.0, 3000.0, 3900.0])
+        prune_window(ts, now=4000.0, window_s=3600.0)
+        self.assertEqual(list(ts), [3000.0, 3900.0])
+
+    def test_empty_is_noop(self):
+        ts = deque()
+        prune_window(ts, now=10.0)
+        self.assertEqual(list(ts), [])
+
+
+class SchedulerLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_connect_creates_single_task_and_last_disconnect_stops(self):
+        sched, *_ = make_scheduler(uids=("a", "b"))
+        self.assertFalse(sched.is_running)
+        await sched.client_connected("a")
+        self.assertTrue(sched.is_running)
+        first = sched._task
+        await sched.client_connected("b")
+        self.assertIs(sched._task, first)
+        await sched.client_disconnected("a")
+        self.assertTrue(sched.is_running)
+        self.assertIs(sched._task, first)
+        await sched.client_disconnected("b")
+        self.assertFalse(sched.is_running)
+        self.assertEqual(sched.presences, {})
+        self.assertTrue(first.done())
+
+    async def test_disconnect_resets_scheduler_state(self):
+        sched, *_ = make_scheduler()
+        await sched.client_connected("a")
+        await sched.tick_once()
+        self.assertIsNotNone(sched.state.last_context)
+        await sched.client_disconnected("a")
+        self.assertIsNone(sched.state.last_context)
+        self.assertIsNone(sched.state.previous_user_idle_seconds)
+
+    async def test_interleaved_connects_disconnects_never_two_loops(self):
+        live = [0]
+        peak = [0]
+
+        class Counting(BehaviorScheduler):
+            async def _run(self):
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                try:
+                    await super()._run()
+                finally:
+                    live[0] -= 1
+
+        uids = tuple(f"u{i}" for i in range(5))
+        sched, *_ = make_scheduler(uids=uids, cls=Counting, tick_seconds=0.001)
+        ops = []
+        for uid in uids:
+            ops.append(sched.client_connected(uid))
+            ops.append(sched.client_disconnected(uid))
+        await asyncio.gather(*ops)
+        for _ in range(5):
+            await asyncio.sleep(0.001)
+        self.assertLessEqual(peak[0], 1)
+        self.assertEqual(sched.presences, {})
+        self.assertFalse(sched.is_running)
+        self.assertEqual(live[0], 0)
+
+    async def test_brain_identity_unchanged_across_stop_start(self):
+        sched, _, contexts, _ = make_scheduler()
+        brain = contexts["a"].pet_brain
+        await sched.client_connected("a")
+        await sched.client_disconnected("a")
+        await sched.client_connected("a")
+        self.assertIs(contexts["a"].pet_brain, brain)
+        self.assertIs(sched.eligibility.brain_for("a"), brain)
+        await sched.client_disconnected("a")
+
+    async def test_tick_exception_does_not_kill_loop(self):
+        sched, *_ = make_scheduler(tick_seconds=0.001)
+        calls = [0]
+
+        async def flaky():
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError("boom")
+
+        sched.tick_once = flaky
+        # Patch `logger.exception` so the expected traceback stays out of the
+        # test output while still asserting the log call.
+        with mock.patch.object(scheduler_module.logger, "exception") as log_exc:
+            await sched.client_connected("a")
+            for _ in range(200):
+                if calls[0] >= 3:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertTrue(sched.is_running)
+            await sched.client_disconnected("a")
+        self.assertGreaterEqual(calls[0], 3)
+        log_exc.assert_called_once_with("[Behavior] tick failed")
+
+
+class TickPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_handled_clients_skips_sampling(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono)
+        brain.config.behavior.enabled = False
+        sensor = FakeSensor(_snapshot())
+        sched, *_ = make_scheduler(brains={"a": brain}, sensor=sensor, clock=mono)
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=mono())
+        await sched.tick_once()
+        self.assertEqual(sensor.calls, 0)
+        self.assertIsNone(sched.state.last_context)
+
+    async def test_no_presences_skips_sampling(self):
+        sensor = FakeSensor(_snapshot())
+        sched, *_ = make_scheduler(sensor=sensor)
+        await sched.tick_once()
+        self.assertEqual(sensor.calls, 0)
+
+    async def test_shared_brain_ticked_once(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono)
+        calls = wrap_tick(brain)
+        sensor = FakeSensor(_snapshot())
+        sched, *_ = make_scheduler(
+            uids=("a", "b"),
+            brains={"a": brain, "b": brain},
+            sensor=sensor,
+            clock=mono,
+        )
+        for uid in ("a", "b"):
+            sched.presences[uid] = ClientPresence(uid=uid, connected_at=mono())
+        await sched.tick_once()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sensor.calls, 1)
+        self.assertIs(sched.state.last_context, sensor.snapshot)
+        self.assertEqual(calls[0].category, "coding")
+
+    async def test_distinct_brains_each_ticked_once(self):
+        mono = FakeMono()
+        brain_a = make_real_brain(mono)
+        brain_b = make_real_brain(mono)
+        calls_a = wrap_tick(brain_a)
+        calls_b = wrap_tick(brain_b)
+        sched, *_ = make_scheduler(
+            uids=("a", "b"), brains={"a": brain_a, "b": brain_b}, clock=mono
+        )
+        for uid in ("a", "b"):
+            sched.presences[uid] = ClientPresence(uid=uid, connected_at=mono())
+        await sched.tick_once()
+        self.assertEqual((len(calls_a), len(calls_b)), (1, 1))
+
+    async def test_user_returned_applied_and_bonus_pending(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono, away_after_min=10.0)
+        calls = wrap_tick(brain)
+        sched, *_ = make_scheduler(
+            brains={"a": brain}, sensor=FakeSensor(_snapshot(idle=5.0)), clock=mono
+        )
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=mono())
+        sched.state.previous_user_idle_seconds = 700.0
+        happiness_before = brain.mood.snapshot()["happiness"]
+        await sched.tick_once()
+        self.assertTrue(calls[0].user_returned)
+        self.assertGreater(brain.mood.snapshot()["happiness"], happiness_before)
+        presence = sched.presences["a"]
+        self.assertTrue(presence.returned_bonus_pending)
+        self.assertEqual(presence.returned_after_s, 700.0)
+        self.assertEqual(sched.state.previous_user_idle_seconds, 5.0)
+
+    async def test_user_returned_not_when_prev_idle_unknown(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono)
+        calls = wrap_tick(brain)
+        sched, *_ = make_scheduler(
+            brains={"a": brain}, sensor=FakeSensor(_snapshot(idle=5.0)), clock=mono
+        )
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=mono())
+        sched.state.previous_user_idle_seconds = None
+        await sched.tick_once()
+        self.assertFalse(calls[0].user_returned)
+        self.assertFalse(sched.presences["a"].returned_bonus_pending)
+
+    async def test_context_disabled_brain_gets_unknown_snapshot(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono, context_enabled=False)
+        calls = wrap_tick(brain)
+        sensor = FakeSensor(_snapshot(idle=5.0))
+        sched, *_ = make_scheduler(brains={"a": brain}, sensor=sensor, clock=mono)
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=mono())
+        sched.state.previous_user_idle_seconds = 700.0
+        await sched.tick_once()
+        received = calls[0].context
+        self.assertIsNone(received.user_idle_seconds)
+        self.assertIsNone(received.process_name)
+        self.assertIsNone(received.fullscreen)
+        self.assertEqual(received.taken_at_wall, _SCHED_WALL)
+        self.assertIsNone(calls[0].category)
+        self.assertFalse(calls[0].user_returned)
+
+    async def test_quiet_seconds_uses_latest_across_clients(self):
+        mono = FakeMono(1000.0)
+        brain = make_real_brain(mono)
+        calls = wrap_tick(brain)
+        sched, *_ = make_scheduler(
+            uids=("a", "b"), brains={"a": brain, "b": brain}, clock=mono
+        )
+        sched.presences["a"] = ClientPresence(
+            uid="a", connected_at=0.0, last_conversation_end=900.0
+        )
+        sched.presences["b"] = ClientPresence(
+            uid="b", connected_at=0.0, last_user_interaction=950.0
+        )
+        await sched.tick_once()
+        self.assertEqual(calls[0].quiet_seconds, 50.0)
+
+    async def test_quiet_seconds_falls_back_to_lifecycle_since(self):
+        mono = FakeMono(1000.0)
+        brain = make_real_brain(mono)
+        calls = wrap_tick(brain)
+        mono.t = 1300.0
+        sched, *_ = make_scheduler(brains={"a": brain}, clock=mono)
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=0.0)
+        await sched.tick_once()
+        self.assertEqual(calls[0].quiet_seconds, 300.0)
+
+    async def test_conversation_running_from_task_or_reserved(self):
+        mono = FakeMono()
+        brain = make_real_brain(mono)
+        calls = wrap_tick(brain)
+        sched, _, _, tasks = make_scheduler(brains={"a": brain}, clock=mono)
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=0.0)
+        await sched.tick_once()
+        self.assertFalse(calls[-1].conversation_running)
+        tasks["a"] = _FakeTask(is_done=False)
+        await sched.tick_once()
+        self.assertTrue(calls[-1].conversation_running)
+        tasks["a"] = _FakeTask(is_done=True)
+        await sched.tick_once()
+        self.assertFalse(calls[-1].conversation_running)
+        sched.presences["a"].reserved = True
+        await sched.tick_once()
+        self.assertTrue(calls[-1].conversation_running)
+
+    async def test_ignored_detection_fires_once(self):
+        mono = FakeMono(1000.0)
+        brain = make_real_brain(mono)
+        events = []
+        original_notify = brain.notify
+
+        def _notify(event, **details):
+            events.append(event)
+            original_notify(event, **details)
+
+        brain.notify = _notify
+        sched, *_ = make_scheduler(brains={"a": brain}, clock=mono)
+        presence = ClientPresence(uid="a", connected_at=0.0)
+        presence.awaiting_reply_since = 1000.0
+        sched.presences["a"] = presence
+
+        mono.t = 1000.0 + 4 * 60
+        await sched.tick_once()
+        self.assertEqual(presence.ignored_count, 0)
+        self.assertEqual(presence.awaiting_reply_since, 1000.0)
+
+        mono.t = 1000.0 + 5 * 60
+        with _LoguruCapture(level="INFO") as records:
+            await sched.tick_once()
+        self.assertEqual(presence.ignored_count, 1)
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertEqual(events.count(BrainEvent.PROACTIVE_IGNORED), 1)
+        self.assertTrue(
+            any("[Proactive] ignored count=1 backoff=20min" in r for r in records)
+        )
+
+        mono.t += 60 * 60
+        await sched.tick_once()
+        self.assertEqual(presence.ignored_count, 1)
+        self.assertEqual(events.count(BrainEvent.PROACTIVE_IGNORED), 1)
+
+    async def test_select_and_dispatch_called_with_now_and_ctx(self):
+        mono = FakeMono(1234.0)
+        sensor = FakeSensor(_snapshot())
+        sched, *_ = make_scheduler(sensor=sensor, clock=mono)
+        sched.presences["a"] = ClientPresence(uid="a", connected_at=0.0)
+        seen = []
+
+        async def _spy(now, ctx):
+            seen.append((now, ctx))
+
+        sched._select_and_dispatch = _spy
+        await sched.tick_once()
+        self.assertEqual(seen, [(1234.0, sensor.snapshot)])
+
+    async def test_connect_records_presence_with_clock(self):
+        mono = FakeMono(42.0)
+        sched, *_ = make_scheduler(clock=mono)
+        await sched.client_connected("a")
+        self.assertEqual(sched.presences["a"].connected_at, 42.0)
+        await sched.client_disconnected("a")
+
+
+class PetBrainExportsTests(unittest.TestCase):
+    def test_package_exports(self):
+        import src.open_llm_vtuber.pet_brain as pkg
+
+        for name in (
+            "ContextSnapshot",
+            "DayPart",
+            "BehaviorKind",
+            "Trigger",
+            "Decision",
+            "ClientPresence",
+        ):
+            self.assertIn(name, pkg.__all__)
+            self.assertTrue(hasattr(pkg, name))
+        self.assertNotIn("BehaviorScheduler", pkg.__all__)
 
 
 if __name__ == "__main__":
