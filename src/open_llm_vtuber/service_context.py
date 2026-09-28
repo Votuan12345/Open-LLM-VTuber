@@ -391,9 +391,25 @@ class ServiceContext:
             self.pet_brain = None
             return replaced
 
-        if self.pet_brain is not None and self.pet_brain.config == pet_brain_config:
-            logger.debug("[PetBrain] Already initialized with the same config.")
-            return False
+        if self.pet_brain is not None:
+            current = self.pet_brain.config
+            if (
+                current.enabled,
+                current.emotion,
+                current.permission,
+            ) == (
+                pet_brain_config.enabled,
+                pet_brain_config.emotion,
+                pet_brain_config.permission,
+            ):
+                if current == pet_brain_config:
+                    logger.debug("[PetBrain] Already initialized with the same config.")
+                else:
+                    logger.debug(
+                        "[PetBrain] Phase 2 settings changed; updating config in place."
+                    )
+                    self.pet_brain.update_config(pet_brain_config)
+                return False
 
         self.pet_brain = PetBrain(pet_brain_config)
         return True

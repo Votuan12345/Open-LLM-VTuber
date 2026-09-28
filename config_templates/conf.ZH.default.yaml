@@ -506,6 +506,54 @@ character_config:
         search: 'read'
         fetch_content: 'read'
 
+    behavior:
+      enabled: True            # 仅在 pet_brain_config.enabled 为 True 时生效
+
+    proactive:
+      enabled: True
+      min_interval_min: 10
+      post_conversation_quiet_min: 3
+      max_per_hour: 3
+      threshold: 0.30
+      chance: 0.35
+      ignored_after_min: 5
+      max_backoff_min: 60
+
+    idle_expression:
+      enabled: True
+      min_interval_min: 3
+      max_per_hour: 10
+      chance: 0.3
+
+    context:
+      enabled: True            # False -> 回退到 NullContextSensor 语义（失效时关闭）
+      away_after_min: 10
+      process_categories:
+        Code.exe: coding
+        devenv.exe: coding
+        pycharm64.exe: coding
+        idea64.exe: coding
+        rider64.exe: coding
+        WindowsTerminal.exe: coding
+        Unity.exe: unity
+        Unity Hub.exe: unity
+        WINWORD.EXE: office
+        EXCEL.EXE: office
+        POWERPNT.EXE: office
+        OUTLOOK.EXE: office
+        ONENOTE.EXE: office
+        chrome.exe: browser
+        msedge.exe: browser
+        firefox.exe: browser
+        brave.exe: browser
+        opera.exe: browser
+        vlc.exe: media
+        Spotify.exe: media
+        PotPlayerMini64.exe: media
+        mpc-hc64.exe: media
+        steam.exe: gaming
+        EpicGamesLauncher.exe: gaming
+
 # 直播平台集成
 live_config:
   bilibili_live:

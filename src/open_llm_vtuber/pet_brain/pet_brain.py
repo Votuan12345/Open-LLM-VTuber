@@ -64,6 +64,10 @@ class PetBrain:
         self.permission = PermissionGuard(config.permission, confirmation)
         logger.info("[PetBrain] Initialized")
 
+    def update_config(self, config: PetBrainConfig) -> None:
+        """Swap in a new config in place, keeping mood/lifecycle/activity state."""
+        self.config = config
+
     def notify(self, event: BrainEvent, **details: Any) -> None:
         if event in (BrainEvent.USER_INPUT, BrainEvent.PROACTIVE_TRIGGER):
             self.lifecycle.ensure_active(event.value)

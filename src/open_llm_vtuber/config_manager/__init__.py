@@ -43,7 +43,15 @@ from .vad import (
     SileroVADConfig,
 )
 from .tts_preprocessor import TTSPreprocessorConfig, TranslatorConfig, DeepLXConfig
-from .pet_brain import PetBrainConfig, PermissionConfig, EmotionGateConfig
+from .pet_brain import (
+    PetBrainConfig,
+    PermissionConfig,
+    EmotionGateConfig,
+    BehaviorConfig,
+    ProactiveConfig,
+    IdleExpressionConfig,
+    ContextConfig,
+)
 from .i18n import I18nMixin, Description, MultiLingualString
 from .agent import (
     AgentConfig,
@@ -117,6 +125,10 @@ __all__ = [
     "PetBrainConfig",
     "PermissionConfig",
     "EmotionGateConfig",
+    "BehaviorConfig",
+    "ProactiveConfig",
+    "IdleExpressionConfig",
+    "ContextConfig",
     # i18n related classes
     "I18nMixin",
     "Description",
