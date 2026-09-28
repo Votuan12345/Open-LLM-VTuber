@@ -26,7 +26,9 @@ from .conversations.conversation_handler import (
     handle_conversation_trigger,
     handle_group_interrupt,
     handle_individual_interrupt,
+    run_proactive_turn,
 )
+from .pet_brain.scheduler import BehaviorScheduler
 
 
 class MessageType(Enum):
@@ -69,6 +71,14 @@ class WebSocketHandler:
         self.current_conversation_tasks: Dict[str, Optional[asyncio.Task]] = {}
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
+        # Exactly one desktop-global behavior scheduler (Mili Phase 2, spec §9)
+        self.behavior_scheduler = BehaviorScheduler(
+            self.client_connections,
+            self.client_contexts,
+            self.current_conversation_tasks,
+            self.chat_group_manager,
+            run_proactive_turn=run_proactive_turn,
+        )
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -122,6 +132,8 @@ class WebSocketHandler:
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
             )
+
+            await self.behavior_scheduler.client_connected(client_uid)
 
             logger.info(f"Connection established for client {client_uid}")
 
@@ -280,6 +292,7 @@ class WebSocketHandler:
 
     async def handle_disconnect(self, client_uid: str) -> None:
         """Handle client disconnection"""
+        await self.behavior_scheduler.client_disconnected(client_uid)
         group = self.chat_group_manager.get_client_group(client_uid)
         if group:
             await handle_group_interrupt(
@@ -318,6 +331,7 @@ class WebSocketHandler:
 
     async def _cleanup_failed_connection(self, client_uid: str) -> None:
         """Clean up failed connection data"""
+        await self.behavior_scheduler.client_disconnected(client_uid)
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
@@ -527,6 +541,7 @@ class WebSocketHandler:
             received_data_buffers=self.received_data_buffers,
             current_conversation_tasks=self.current_conversation_tasks,
             broadcast_to_group=self.broadcast_to_group,
+            behavior_scheduler=self.behavior_scheduler,
         )
 
     async def _handle_fetch_configs(

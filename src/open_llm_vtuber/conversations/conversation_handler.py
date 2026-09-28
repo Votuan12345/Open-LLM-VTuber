@@ -9,11 +9,55 @@ from loguru import logger
 from ..chat_group import ChatGroupManager
 from ..chat_history_manager import store_message
 from ..service_context import ServiceContext
+from ..pet_brain.scheduler import BehaviorScheduler
 from .group_conversation import process_group_conversation
 from .single_conversation import process_single_conversation
 from .conversation_utils import EMOJI_LIST
 from .types import GroupConversationState
 from prompts import prompt_loader
+
+PROACTIVE_METADATA = {
+    "proactive_speak": True,
+    "skip_memory": True,  # Skip storing in AI's internal memory
+    "skip_history": True,  # Skip storing in local conversation history
+}
+
+
+def load_proactive_prompt(context: ServiceContext) -> str:
+    """Load the configured proactive speak prompt, with the legacy fallbacks."""
+    try:
+        # Get proactive speak prompt from config
+        prompt_name = "proactive_speak_prompt"
+        prompt_file = context.system_config.tool_prompts.get(prompt_name)
+        if prompt_file:
+            return prompt_loader.load_util(prompt_file)
+        logger.warning("Proactive speak prompt not configured, using default")
+        return "Please say something."
+    except Exception as e:
+        logger.error(f"Error loading proactive speak prompt: {e}")
+        return "Please say something."
+
+
+async def run_proactive_turn(
+    context: ServiceContext,
+    websocket_send: Callable,
+    client_uid: str,
+    context_block: str,
+) -> None:
+    """Proactive turn committed by the BehaviorScheduler (spec §8.7)."""
+    await websocket_send(
+        json.dumps({"type": "full-text", "text": "AI wants to speak something..."})
+    )
+    user_input = load_proactive_prompt(context) + "\n\n" + context_block
+    await process_single_conversation(
+        context=context,
+        websocket_send=websocket_send,
+        client_uid=client_uid,
+        user_input=user_input,
+        images=None,
+        session_emoji=np.random.choice(EMOJI_LIST),
+        metadata=dict(PROACTIVE_METADATA),
+    )
 
 
 async def handle_conversation_trigger(
@@ -28,31 +72,25 @@ async def handle_conversation_trigger(
     received_data_buffers: Dict[str, np.ndarray],
     current_conversation_tasks: Dict[str, Optional[asyncio.Task]],
     broadcast_to_group: Callable,
+    behavior_scheduler: Optional[BehaviorScheduler] = None,
 ) -> None:
     """Handle triggers that start a conversation"""
     metadata = None
+    handled = behavior_scheduler is not None and behavior_scheduler.eligibility.handles(
+        client_uid
+    )
 
     if msg_type == "ai-speak-signal":
-        try:
-            # Get proactive speak prompt from config
-            prompt_name = "proactive_speak_prompt"
-            prompt_file = context.system_config.tool_prompts.get(prompt_name)
-            if prompt_file:
-                user_input = prompt_loader.load_util(prompt_file)
-            else:
-                logger.warning("Proactive speak prompt not configured, using default")
-                user_input = "Please say something."
-        except Exception as e:
-            logger.error(f"Error loading proactive speak prompt: {e}")
-            user_input = "Please say something."
+        if handled:
+            # Only a request: the scheduler decides and may refuse (spec §8.1).
+            behavior_scheduler.request_proactive(client_uid, data.get("images"))
+            return
+
+        user_input = load_proactive_prompt(context)
 
         # Add metadata to indicate this is a proactive speak request
         # that should be skipped in both memory and history
-        metadata = {
-            "proactive_speak": True,
-            "skip_memory": True,  # Skip storing in AI's internal memory
-            "skip_history": True,  # Skip storing in local conversation history
-        }
+        metadata = dict(PROACTIVE_METADATA)
 
         await websocket.send_text(
             json.dumps(
@@ -96,17 +134,39 @@ async def handle_conversation_trigger(
             )
     else:
         # Use client_uid as task key for individual conversations
-        current_conversation_tasks[client_uid] = asyncio.create_task(
-            process_single_conversation(
-                context=context,
-                websocket_send=websocket.send_text,
-                client_uid=client_uid,
-                user_input=user_input,
-                images=images,
-                session_emoji=session_emoji,
-                metadata=metadata,
+        if not handled:
+            current_conversation_tasks[client_uid] = asyncio.create_task(
+                process_single_conversation(
+                    context=context,
+                    websocket_send=websocket.send_text,
+                    client_uid=client_uid,
+                    user_input=user_input,
+                    images=images,
+                    session_emoji=session_emoji,
+                    metadata=metadata,
+                )
             )
-        )
+            return
+
+        # User input preempts a running proactive turn; the user task is only
+        # created after it has really finished (spec §8.6).
+        task = None
+        try:
+            await behavior_scheduler.preempt_for_user(client_uid)
+            task = asyncio.create_task(
+                process_single_conversation(
+                    context=context,
+                    websocket_send=websocket.send_text,
+                    client_uid=client_uid,
+                    user_input=user_input,
+                    images=images,
+                    session_emoji=session_emoji,
+                    metadata=metadata,
+                )
+            )
+            current_conversation_tasks[client_uid] = task
+        finally:
+            behavior_scheduler.user_turn_registered(client_uid, task)
 
 
 async def handle_individual_interrupt(

@@ -69,6 +69,10 @@ from src.open_llm_vtuber.pet_brain.rhythm import (
     split_by_day_part,
 )
 from src.open_llm_vtuber.service_context import ServiceContext
+from src.open_llm_vtuber.conversations import (
+    conversation_handler as conv_handler_module,
+)
+from src.open_llm_vtuber.websocket_handler import WebSocketHandler
 
 
 class _LoguruCapture:
@@ -2696,3 +2700,264 @@ class PreemptTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreemptFollowupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_concurrent_preempts_cancel_once(self):
+        events = []
+        stub = _EmittingProactive(events, cancel_delay=0.02)
+        sched, _, _, _, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+        cancels = []
+        original_cancel = proactive.cancel
+
+        def _spy_cancel(*args, **kwargs):
+            cancels.append(1)
+            return original_cancel(*args, **kwargs)
+
+        proactive.cancel = _spy_cancel
+        await asyncio.gather(sched.preempt_for_user("a"), sched.preempt_for_user("a"))
+        self.assertEqual(len(cancels), 1)
+        self.assertTrue(proactive.done())
+
+    async def test_done_but_callback_pending_not_ignored(self):
+        events = []
+        stub = _EmittingProactive(events, returns=True)
+        sched, _, _, _, tasks, mono = make_behavior_scheduler(stub=stub)
+        brain_events = _spy_brain_events(sched.eligibility.brain_for("a"))
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        # Let the task body finish; its done-callbacks are only scheduled when
+        # the preemption starts.
+        while not proactive.done():
+            await asyncio.sleep(0)
+        await sched.preempt_for_user("a")
+        presence = sched.presences["a"]
+        self.assertIsNone(presence.awaiting_reply_since)
+        sched.user_turn_registered("a", None)
+
+        mono.t += 10 * 60
+        await sched.tick_once()
+        self.assertNotIn(BrainEvent.PROACTIVE_IGNORED, brain_events)
+
+    async def test_preempt_sends_nothing_to_client(self):
+        events = []
+        stub = _EmittingProactive(events)
+        sched, _, connections, _, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        await asyncio.sleep(0.003)
+        before = list(connections["a"].messages)
+        await sched.preempt_for_user("a")
+        self.assertEqual(connections["a"].messages, before)
+        sched.user_turn_registered("a", None)
+
+
+class _FakeConversation:
+    """Stands in for `process_single_conversation`; records its kwargs."""
+
+    def __init__(self, events=None, proactive=None):
+        self.calls = []
+        self.events = events
+        self.proactive = proactive
+        self.proactive_done_at_start = None
+
+    async def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.proactive is not None:
+            self.proactive_done_at_start = self.proactive.done()
+        if self.events is not None:
+            self.events.append("user_start")
+        await asyncio.sleep(0.003)
+
+
+def _legacy_context(pet_brain):
+    return SimpleNamespace(
+        pet_brain=pet_brain,
+        system_config=SimpleNamespace(tool_prompts={}),
+        live2d_model=SimpleNamespace(emo_map={"neutral": 0}),
+    )
+
+
+async def _trigger(msg_type, data, uid, sched, connections, contexts, tasks):
+    await conv_handler_module.handle_conversation_trigger(
+        msg_type=msg_type,
+        data=data,
+        client_uid=uid,
+        context=contexts[uid],
+        websocket=connections[uid],
+        client_contexts=contexts,
+        client_connections=connections,
+        chat_group_manager=_NoGroupManager(),
+        received_data_buffers={},
+        current_conversation_tasks=tasks,
+        broadcast_to_group=None,
+        behavior_scheduler=sched,
+    )
+
+
+LEGACY_PROACTIVE_METADATA = {
+    "proactive_speak": True,
+    "skip_memory": True,
+    "skip_history": True,
+}
+
+
+class IntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def _assert_legacy_speak(self, pet_brain):
+        sched, connections, contexts, tasks = make_scheduler(brains={"a": pet_brain})
+        contexts["a"] = _legacy_context(pet_brain)
+        fake = _FakeConversation()
+        img = {"source": "screen", "data": "x"}
+        with (
+            mock.patch.object(conv_handler_module, "process_single_conversation", fake),
+            mock.patch.object(sched, "request_proactive") as spy,
+            _LoguruCapture(level="WARNING"),
+        ):
+            await _trigger(
+                "ai-speak-signal",
+                {"images": [img]},
+                "a",
+                sched,
+                connections,
+                contexts,
+                tasks,
+            )
+            await tasks["a"]
+        spy.assert_not_called()
+        texts = [json.loads(m).get("text") for m in connections["a"].messages]
+        self.assertIn("AI wants to speak something...", texts)
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0]["images"], [img])
+        self.assertEqual(fake.calls[0]["metadata"], LEGACY_PROACTIVE_METADATA)
+
+    async def test_disabled_brain_uses_legacy_speak_path(self):
+        await self._assert_legacy_speak(None)
+
+    async def test_behavior_disabled_uses_legacy_path(self):
+        brain = make_real_brain(FakeMono())
+        brain.config.behavior.enabled = False
+        await self._assert_legacy_speak(brain)
+
+    async def test_handled_speak_signal_goes_to_scheduler(self):
+        sched, stub, connections, contexts, tasks, mono = make_behavior_scheduler()
+        sched.presences["a"].last_proactive = mono() - 60
+        fake = _FakeConversation()
+        with (
+            mock.patch.object(conv_handler_module, "process_single_conversation", fake),
+            _LoguruCapture(level="INFO"),
+        ):
+            await _trigger(
+                "ai-speak-signal", {}, "a", sched, connections, contexts, tasks
+            )
+        self.assertEqual(connections["a"].messages, [])
+        self.assertNotIn("a", tasks)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(stub.calls, [])
+
+    async def test_text_input_preempts_proactive(self):
+        events = []
+        stub = _EmittingProactive(events)
+        sched, _, connections, contexts, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+        fake = _FakeConversation(events=events, proactive=proactive)
+        with mock.patch.object(
+            conv_handler_module, "process_single_conversation", fake
+        ):
+            await _trigger(
+                "text-input", {"text": "hi"}, "a", sched, connections, contexts, tasks
+            )
+            user = tasks["a"]
+            self.assertIsNot(user, proactive)
+            self.assertFalse(sched.presences["a"].user_turn_pending)
+            await user
+        self.assertTrue(fake.proactive_done_at_start)
+        self.assertEqual(fake.calls[0]["user_input"], "hi")
+        start = events.index("user_start")
+        self.assertNotIn("proactive_out", events[start:])
+
+    async def test_cancelled_handler_releases_pending(self):
+        events = []
+        stub = _EmittingProactive(events, cancel_delay=0.05)
+        sched, _, connections, contexts, tasks, _ = make_behavior_scheduler(stub=stub)
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+        fake = _FakeConversation()
+        with mock.patch.object(
+            conv_handler_module, "process_single_conversation", fake
+        ):
+            handler = asyncio.create_task(
+                _trigger(
+                    "text-input",
+                    {"text": "hi"},
+                    "a",
+                    sched,
+                    connections,
+                    contexts,
+                    tasks,
+                )
+            )
+            await asyncio.sleep(0.01)
+            self.assertTrue(sched.presences["a"].user_turn_pending)
+            handler.cancel()
+            await _drain(handler)
+        self.assertFalse(sched.presences["a"].user_turn_pending)
+        self.assertEqual(fake.calls, [])
+        await _drain(proactive)
+
+    async def test_websocket_handler_hooks(self):
+        handler = WebSocketHandler(SimpleNamespace())
+        self.assertIsInstance(handler.behavior_scheduler, BehaviorScheduler)
+        self.assertIs(
+            handler.behavior_scheduler._run_proactive_turn,
+            conv_handler_module.run_proactive_turn,
+        )
+        handler.behavior_scheduler.client_connected = mock.AsyncMock()
+        handler.behavior_scheduler.client_disconnected = mock.AsyncMock()
+        handler._init_service_context = mock.AsyncMock(return_value=None)
+        handler._store_client_data = mock.AsyncMock()
+        handler._send_initial_messages = mock.AsyncMock()
+
+        await handler.handle_new_connection(FakeWS(), "n")
+        await handler.handle_disconnect("x")
+        await handler._cleanup_failed_connection("y")
+
+        handler.behavior_scheduler.client_connected.assert_awaited_once_with("n")
+        self.assertEqual(
+            handler.behavior_scheduler.client_disconnected.await_args_list,
+            [mock.call("x"), mock.call("y")],
+        )
+
+    async def test_run_proactive_turn_prompt(self):
+        ctx = SimpleNamespace(
+            system_config=SimpleNamespace(
+                tool_prompts={"proactive_speak_prompt": "proactive_speak_prompt"}
+            )
+        )
+        ws = FakeWS()
+        fake = _FakeConversation()
+        with (
+            mock.patch.object(conv_handler_module, "process_single_conversation", fake),
+            mock.patch.object(
+                conv_handler_module.prompt_loader,
+                "load_util",
+                return_value="BASE PROMPT",
+            ),
+        ):
+            await conv_handler_module.run_proactive_turn(
+                ctx, ws.send_text, "a", "BLOCK"
+            )
+        self.assertEqual(
+            json.loads(ws.messages[0]),
+            {"type": "full-text", "text": "AI wants to speak something..."},
+        )
+        call = fake.calls[0]
+        self.assertEqual(call["user_input"], "BASE PROMPT\n\nBLOCK")
+        self.assertIsNone(call["images"])
+        self.assertEqual(call["client_uid"], "a")
+        self.assertIs(call["context"], ctx)
+        self.assertEqual(call["metadata"], LEGACY_PROACTIVE_METADATA)

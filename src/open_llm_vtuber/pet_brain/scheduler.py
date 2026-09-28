@@ -467,6 +467,10 @@ class BehaviorScheduler:
         is only a diagnostic threshold. Never touches `reserved` /
         `proactive_task` (the proactive done-callback releases them), never
         takes the lifecycle lock.
+
+        Callers must call `user_turn_registered(uid, task_or_None)` in a
+        `finally`, otherwise `user_turn_pending` stays set if they are
+        cancelled while waiting here.
         """
 
         presence = self.presences.get(uid)
@@ -481,7 +485,8 @@ class BehaviorScheduler:
         task = presence.proactive_task
         if task is None:
             return
-        if not task.done():
+        if not task.done() and not presence.proactive_preempted:
+            # A second concurrent preempt only waits; it never re-cancels.
             presence.proactive_preempted = True
             task.cancel()
 
