@@ -1,8 +1,10 @@
 """Phase 2 behavior tests. Run from repo root: uv run python -m unittest tests.test_behavior_phase2 -v"""
 
 import inspect
+import random
 import sys
 import unittest
+from collections import deque
 from datetime import datetime, timedelta
 
 from pydantic import ValidationError
@@ -21,6 +23,15 @@ from loguru import logger
 
 from src.open_llm_vtuber.pet_brain import BrainEvent, Mood, PetBrain
 from src.open_llm_vtuber.pet_brain import context as context_module
+from src.open_llm_vtuber.pet_brain.behavior import (
+    BehaviorKind,
+    BehaviorSelector,
+    RETURNED_BONUS,
+    SelectionInput,
+    Trigger,
+    effective_min_interval_s,
+    willingness,
+)
 from src.open_llm_vtuber.pet_brain.context import (
     ContextSnapshot,
     NullContextSensor,
@@ -38,7 +49,8 @@ from src.open_llm_vtuber.pet_brain.lifecycle import (
     LifecyclePhase,
 )
 from src.open_llm_vtuber.pet_brain.mood import MOOD_KEYS, MoodState
-from src.open_llm_vtuber.pet_brain.pet_brain import BrainTickInputs
+from src.open_llm_vtuber.pet_brain.pet_brain import ActivityState, BrainTickInputs
+from src.open_llm_vtuber.pet_brain.presence import ClientPresence
 from src.open_llm_vtuber.pet_brain.rhythm import (
     DayPart,
     day_part_at,
@@ -678,6 +690,373 @@ class BrainTickTests(unittest.TestCase):
         )
 
         self.assertEqual(brain.lifecycle.phase, LifecyclePhase.AWAY)
+
+
+class _FixedRandom:
+    """Duck-typed stand-in for random.Random that always returns `value`."""
+
+    def __init__(self, value: float):
+        self.value = value
+
+    def random(self) -> float:
+        return self.value
+
+
+BASELINE_WALL = datetime(2024, 1, 1, 14, 0)
+BASELINE_MOOD = {
+    "social_need": 0.9,
+    "boredom": 0.9,
+    "curiosity": 0.5,
+    "sleepiness": 0.0,
+    "energy": 1.0,
+    "happiness": 0.5,
+}
+
+
+def make_input(**overrides):
+    presence = overrides.pop(
+        "presence",
+        ClientPresence(uid="u1", connected_at=0.0),
+    )
+    context = overrides.pop(
+        "context",
+        ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=600.0,
+            process_name=None,
+            fullscreen=False,
+        ),
+    )
+    mood = overrides.pop("mood", dict(BASELINE_MOOD))
+    if "config" in overrides:
+        config = overrides.pop("config")
+    else:
+        config = PetBrainConfig(enabled=True)
+        # Isolate the proactive-stage gates by default; idle-stage tests opt
+        # back in explicitly via `config=`.
+        config.idle_expression.enabled = False
+
+    base = dict(
+        trigger=Trigger.TICK,
+        now=1_000_000.0,
+        presence=presence,
+        activity=ActivityState.IDLE,
+        lifecycle=LifecyclePhase.ACTIVE,
+        mood=mood,
+        context=context,
+        category="browser",
+        config=config,
+        emo_map={},
+    )
+    base.update(overrides)
+    return SelectionInput(**base)
+
+
+class SelectorTests(unittest.TestCase):
+    def _selector(self, rng_value=0.0):
+        return BehaviorSelector(rng=_FixedRandom(rng_value))
+
+    def test_baseline_proactive_speak(self):
+        decision = self._selector().select(make_input())
+        self.assertEqual(decision.kind, BehaviorKind.PROACTIVE_SPEAK)
+
+    # --- Vetoes -----------------------------------------------------
+
+    def test_veto_conversation_lock(self):
+        decision = self._selector().select(make_input(activity=ActivityState.TALKING))
+        self.assertEqual(decision.kind, BehaviorKind.DO_NOTHING)
+        self.assertEqual(decision.reason, "conversation_lock")
+
+    def test_veto_lifecycle_sleep(self):
+        decision = self._selector().select(make_input(lifecycle=LifecyclePhase.SLEEP))
+        self.assertEqual(decision.reason, "lifecycle_sleep")
+
+    def test_veto_lifecycle_away(self):
+        decision = self._selector().select(make_input(lifecycle=LifecyclePhase.AWAY))
+        self.assertEqual(decision.reason, "lifecycle_away")
+
+    def test_veto_fullscreen_true(self):
+        ctx = ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=600.0,
+            process_name=None,
+            fullscreen=True,
+        )
+        decision = self._selector().select(make_input(context=ctx))
+        self.assertEqual(decision.reason, "fullscreen")
+
+    def test_veto_fullscreen_unknown(self):
+        ctx = ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=600.0,
+            process_name=None,
+            fullscreen=None,
+        )
+        decision = self._selector().select(make_input(context=ctx))
+        self.assertEqual(decision.reason, "context_unknown")
+
+    # --- Proactive gates ---------------------------------------------
+
+    def test_proactive_disabled(self):
+        cfg = PetBrainConfig(enabled=True)
+        cfg.proactive.enabled = False
+        cfg.idle_expression.enabled = False
+        decision = self._selector().select(make_input(config=cfg))
+        self.assertEqual(decision.reason, "proactive_disabled")
+
+    def test_context_unknown_idle_none(self):
+        ctx = ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=None,
+            process_name=None,
+            fullscreen=False,
+        )
+        decision = self._selector().select(make_input(context=ctx))
+        self.assertEqual(decision.reason, "context_unknown")
+
+    def test_context_unknown_category_none(self):
+        decision = self._selector().select(make_input(category=None))
+        self.assertEqual(decision.reason, "context_unknown")
+
+    def test_cooldown_at_9_minutes(self):
+        presence = ClientPresence(
+            uid="u1", connected_at=0.0, last_proactive=1_000_000.0 - 9 * 60
+        )
+        decision = self._selector().select(make_input(presence=presence))
+        self.assertEqual(decision.reason, "cooldown")
+
+    def test_cooldown_allowed_at_10_minutes(self):
+        presence = ClientPresence(
+            uid="u1", connected_at=0.0, last_proactive=1_000_000.0 - 10 * 60
+        )
+        decision = self._selector().select(make_input(presence=presence))
+        self.assertEqual(decision.kind, BehaviorKind.PROACTIVE_SPEAK)
+
+    def test_post_conversation_quiet(self):
+        presence = ClientPresence(
+            uid="u1",
+            connected_at=0.0,
+            last_conversation_end=1_000_000.0 - 60,
+        )
+        decision = self._selector().select(make_input(presence=presence))
+        self.assertEqual(decision.reason, "post_conversation_quiet")
+
+    def test_post_conversation_quiet_uses_latest_of_both_fields(self):
+        presence = ClientPresence(
+            uid="u1",
+            connected_at=0.0,
+            last_conversation_end=1_000_000.0 - 1000,
+            last_user_interaction=1_000_000.0 - 60,
+        )
+        decision = self._selector().select(make_input(presence=presence))
+        self.assertEqual(decision.reason, "post_conversation_quiet")
+
+    def test_hourly_cap_with_3_inside_60_min(self):
+        now = 1_000_000.0
+        ts = deque([now - 10 * 60, now - 20 * 60, now - 30 * 60])
+        presence = ClientPresence(uid="u1", connected_at=0.0, proactive_timestamps=ts)
+        decision = self._selector().select(make_input(presence=presence, now=now))
+        self.assertEqual(decision.reason, "hourly_cap")
+
+    def test_hourly_cap_allowed_when_one_is_61_minutes_old(self):
+        now = 1_000_000.0
+        ts = deque([now - 61 * 60, now - 20 * 60, now - 30 * 60])
+        presence = ClientPresence(uid="u1", connected_at=0.0, proactive_timestamps=ts)
+        decision = self._selector().select(make_input(presence=presence, now=now))
+        self.assertEqual(decision.kind, BehaviorKind.PROACTIVE_SPEAK)
+
+    def test_hourly_cap_check_does_not_mutate_presence(self):
+        now = 1_000_000.0
+        ts = deque([now - 61 * 60, now - 20 * 60, now - 30 * 60])
+        presence = ClientPresence(uid="u1", connected_at=0.0, proactive_timestamps=ts)
+        self._selector().select(make_input(presence=presence, now=now))
+        self.assertEqual(len(presence.proactive_timestamps), 3)
+
+    def test_user_busy_coding_idle_60_refused(self):
+        ctx = ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=60.0,
+            process_name=None,
+            fullscreen=False,
+        )
+        decision = self._selector().select(make_input(context=ctx, category="coding"))
+        self.assertEqual(decision.reason, "user_busy")
+
+    def test_user_busy_coding_idle_130_allowed(self):
+        ctx = ContextSnapshot(
+            taken_at_wall=BASELINE_WALL,
+            user_idle_seconds=130.0,
+            process_name=None,
+            fullscreen=False,
+        )
+        decision = self._selector().select(
+            make_input(
+                context=ctx,
+                category="coding",
+                mood={
+                    "social_need": 1.0,
+                    "boredom": 1.0,
+                    "curiosity": 1.0,
+                    "sleepiness": 0.0,
+                    "energy": 1.0,
+                    "happiness": 0.5,
+                },
+            )
+        )
+        self.assertEqual(decision.kind, BehaviorKind.PROACTIVE_SPEAK)
+
+    def test_low_willingness(self):
+        decision = self._selector().select(make_input(category="gaming"))
+        self.assertEqual(decision.reason, "low_willingness")
+        self.assertEqual(decision.willingness, 0.0)
+
+    def test_chance_rejected(self):
+        decision = self._selector(rng_value=0.99).select(make_input())
+        self.assertEqual(decision.reason, "chance")
+        self.assertIsNotNone(decision.willingness)
+
+    # --- effective_min_interval_s ------------------------------------
+
+    def test_effective_min_interval_s_backoff(self):
+        cfg = PetBrainConfig(enabled=True).proactive
+        self.assertEqual(effective_min_interval_s(cfg, 0), 600.0)
+        self.assertEqual(effective_min_interval_s(cfg, 1), 1200.0)
+        self.assertEqual(effective_min_interval_s(cfg, 2), 2400.0)
+        self.assertEqual(effective_min_interval_s(cfg, 3), 3600.0)
+        self.assertEqual(effective_min_interval_s(cfg, 5), 3600.0)
+
+    # --- willingness ---------------------------------------------------
+
+    def test_willingness_default_mood_browser_afternoon(self):
+        default_mood = {
+            "happiness": 0.6,
+            "energy": 0.7,
+            "curiosity": 0.5,
+            "boredom": 0.2,
+            "social_need": 0.4,
+            "focus": 0.3,
+            "sleepiness": 0.2,
+        }
+        w = willingness(default_mood, "browser", DayPart.AFTERNOON, False)
+        self.assertAlmostEqual(w, 0.275, places=3)
+
+    def test_willingness_after_30_minutes(self):
+        mood = {
+            "social_need": 0.45,
+            "boredom": 0.275,
+            "curiosity": 0.5,
+            "sleepiness": 0.21,
+            "energy": 0.685,
+        }
+        w = willingness(mood, "browser", DayPart.AFTERNOON, False)
+        self.assertAlmostEqual(w, 0.307, places=2)
+
+    def test_willingness_gaming_is_zero(self):
+        w = willingness(BASELINE_MOOD, "gaming", DayPart.AFTERNOON, False)
+        self.assertEqual(w, 0.0)
+
+    def test_willingness_late_night_halves_value(self):
+        w_afternoon = willingness(BASELINE_MOOD, "browser", DayPart.AFTERNOON, False)
+        w_late_night = willingness(BASELINE_MOOD, "browser", DayPart.LATE_NIGHT, False)
+        self.assertAlmostEqual(w_late_night, w_afternoon * 0.5, places=6)
+
+    def test_willingness_returned_bonus_adds(self):
+        w = willingness(BASELINE_MOOD, "browser", DayPart.AFTERNOON, False)
+        w_bonus = willingness(BASELINE_MOOD, "browser", DayPart.AFTERNOON, True)
+        self.assertAlmostEqual(w_bonus, w + RETURNED_BONUS, places=6)
+
+    # --- REQUEST never produces IDLE_EXPRESSION -----------------------
+
+    def test_request_refused_proactive_never_idle_expression(self):
+        cfg = PetBrainConfig(enabled=True)
+        cfg.idle_expression.enabled = True
+        decision = self._selector(rng_value=0.0).select(
+            make_input(
+                trigger=Trigger.REQUEST,
+                category="gaming",
+                config=cfg,
+                emo_map={"neutral": 0},
+            )
+        )
+        self.assertEqual(decision.kind, BehaviorKind.DO_NOTHING)
+        self.assertNotEqual(decision.kind, BehaviorKind.IDLE_EXPRESSION)
+
+    # --- Idle expression ------------------------------------------------
+
+    def _idle_ready_input(self, **overrides):
+        """A TICK input where the proactive stage refuses (low willingness)
+        but the idle-expression stage is otherwise eligible."""
+
+        overrides.setdefault("category", "gaming")  # forces low_willingness
+        overrides.setdefault("trigger", Trigger.TICK)
+        if "config" not in overrides:
+            cfg = PetBrainConfig(enabled=True)
+            cfg.idle_expression.enabled = True
+            overrides["config"] = cfg
+        return make_input(**overrides)
+
+    def test_idle_expression_sleepy(self):
+        mood = dict(BASELINE_MOOD)
+        mood["sleepiness"] = 0.7
+        decision = self._selector(rng_value=0.0).select(
+            self._idle_ready_input(mood=mood, emo_map={"sleepy": 5, "neutral": 0})
+        )
+        self.assertEqual(decision.kind, BehaviorKind.IDLE_EXPRESSION)
+        self.assertEqual(decision.emotion, "sleepy")
+
+    def test_idle_expression_falls_back_to_neutral(self):
+        mood = dict(BASELINE_MOOD)
+        mood["sleepiness"] = 0.7
+        decision = self._selector(rng_value=0.0).select(
+            self._idle_ready_input(mood=mood, emo_map={"neutral": 0})
+        )
+        self.assertEqual(decision.kind, BehaviorKind.IDLE_EXPRESSION)
+        self.assertEqual(decision.emotion, "neutral")
+
+    def test_idle_expression_no_expression_available(self):
+        mood = dict(BASELINE_MOOD)
+        mood["sleepiness"] = 0.7
+        decision = self._selector(rng_value=0.0).select(
+            self._idle_ready_input(mood=mood, emo_map={"joy": 3})
+        )
+        self.assertEqual(decision.kind, BehaviorKind.DO_NOTHING)
+        self.assertEqual(decision.reason, "no_expression_available")
+
+    def test_idle_expression_empty_emo_map(self):
+        mood = dict(BASELINE_MOOD)
+        mood["sleepiness"] = 0.7
+        decision = self._selector(rng_value=0.0).select(
+            self._idle_ready_input(mood=mood, emo_map={})
+        )
+        self.assertEqual(decision.kind, BehaviorKind.DO_NOTHING)
+        self.assertEqual(decision.reason, "no_expression_available")
+
+    # --- Deterministic rng ----------------------------------------------
+
+    def test_deterministic_rng_same_sequence(self):
+        idle_cfg = PetBrainConfig(enabled=True)
+        idle_cfg.idle_expression.enabled = True
+        inputs = [
+            make_input(),
+            make_input(category="gaming"),
+            make_input(
+                mood={**BASELINE_MOOD, "sleepiness": 0.7},
+                category="gaming",
+                emo_map={"sleepy": 5, "neutral": 0},
+                config=idle_cfg,
+            ),
+        ]
+
+        selector_a = BehaviorSelector(rng=random.Random(1))
+        selector_b = BehaviorSelector(rng=random.Random(1))
+
+        results_a = [selector_a.select(inp) for inp in inputs]
+        results_b = [selector_b.select(inp) for inp in inputs]
+
+        self.assertEqual(
+            [(d.kind, d.reason, d.emotion) for d in results_a],
+            [(d.kind, d.reason, d.emotion) for d in results_b],
+        )
 
 
 if __name__ == "__main__":
