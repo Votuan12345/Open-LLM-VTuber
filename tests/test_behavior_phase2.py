@@ -2426,5 +2426,273 @@ class PetBrainExportsTests(unittest.TestCase):
         self.assertNotIn("BehaviorScheduler", pkg.__all__)
 
 
+class _EmittingProactive:
+    """Fake proactive turn: records `proactive_out` every 1 ms until cancelled.
+
+    `cancel_delay` delays the cancellation (catches CancelledError, sleeps,
+    re-raises) so the task still ends cancelled. `returns=True` emits once
+    and completes normally.
+    """
+
+    def __init__(self, events, cancel_delay=0.0, returns=False):
+        self.events = events
+        self.cancel_delay = cancel_delay
+        self.returns = returns
+
+    async def __call__(self, context, websocket_send, client_uid, context_block):
+        if self.returns:
+            self.events.append("proactive_out")
+            return
+        try:
+            while True:
+                self.events.append("proactive_out")
+                await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            if self.cancel_delay:
+                await asyncio.sleep(self.cancel_delay)
+            raise
+
+
+def _spy_brain_events(brain):
+    events = []
+    original_notify = brain.notify
+
+    def _notify(event, **details):
+        events.append(event)
+        original_notify(event, **details)
+
+    brain.notify = _notify
+    return events
+
+
+async def _cancel_and_drain(task):
+    if task is not None:
+        task.cancel()
+        await _drain(task)
+
+
+class PreemptTests(unittest.IsolatedAsyncioTestCase):
+    def _setup(self, cancel_delay=0.0, returns=False):
+        events = []
+        stub = _EmittingProactive(events, cancel_delay=cancel_delay, returns=returns)
+        sched, _, _, _, tasks, mono = make_behavior_scheduler(stub=stub)
+        brain_events = _spy_brain_events(sched.eligibility.brain_for("a"))
+        return sched, tasks, mono, events, brain_events
+
+    async def test_user_preempts_running_proactive(self):
+        sched, tasks, mono, events, brain_events = self._setup()
+        d = sched.request_proactive("a")
+        self.assertIs(d.kind, BehaviorKind.PROACTIVE_SPEAK)
+        proactive = tasks["a"]
+        await asyncio.sleep(0.005)
+        self.assertIn("proactive_out", events)
+        presence = sched.presences["a"]
+        presence.ignored_count = 2
+        presence.awaiting_reply_since = mono() - 10
+
+        await sched.preempt_for_user("a")
+
+        self.assertTrue(proactive.done())
+        self.assertTrue(proactive.cancelled())
+        self.assertTrue(presence.user_turn_pending)
+        self.assertEqual(presence.last_user_interaction, mono())
+
+        seen = {}
+
+        async def user_turn():
+            seen["proactive_done"] = proactive.done()
+            events.append("user_start")
+            await asyncio.sleep(0.005)
+
+        user = asyncio.create_task(user_turn())
+        tasks["a"] = user
+        sched.user_turn_registered("a", user)
+        self.assertFalse(presence.user_turn_pending)
+        mono.t += 20
+        await user
+        await asyncio.sleep(0)
+
+        self.assertTrue(seen["proactive_done"])
+        start = events.index("user_start")
+        self.assertNotIn("proactive_out", events[start:])
+        self.assertFalse(presence.reserved)
+        self.assertIsNone(presence.proactive_task)
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertEqual(presence.ignored_count, 0)
+        self.assertEqual(presence.last_conversation_end, mono())
+        self.assertNotIn(BrainEvent.PROACTIVE_SPOKEN, brain_events)
+
+        mono.t += 10 * 60
+        await sched.tick_once()
+        self.assertNotIn(BrainEvent.PROACTIVE_IGNORED, brain_events)
+        self.assertEqual(presence.ignored_count, 0)
+        await _cancel_and_drain(tasks["a"])
+
+    async def test_pending_blocks_commit_during_wait(self):
+        sched, tasks, _, _, _ = self._setup(cancel_delay=0.05)
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+        preempt = asyncio.create_task(sched.preempt_for_user("a"))
+        await asyncio.sleep(0.01)
+        self.assertFalse(preempt.done())
+        self.assertFalse(proactive.done())
+        presence = sched.presences["a"]
+        self.assertTrue(presence.user_turn_pending)
+
+        d = sched.request_proactive("a")
+        self.assertIs(d.kind, BehaviorKind.DO_NOTHING)
+        # `reserved` is still held by the not-yet-finished proactive task and
+        # eligibility reports it first; `user_turn_pending` also blocks.
+        self.assertIn(d.reason, ("reserved", "user_turn_pending"))
+        self.assertIs(tasks["a"], proactive)
+
+        await preempt
+        self.assertTrue(proactive.done())
+        self.assertFalse(presence.reserved)
+        # After the proactive task released `reserved` and before the user
+        # task is registered, `user_turn_pending` alone closes the window.
+        d = sched.request_proactive("a")
+        self.assertEqual(
+            (d.kind, d.reason), (BehaviorKind.DO_NOTHING, "user_turn_pending")
+        )
+        self.assertIs(tasks["a"], proactive)
+        sched.user_turn_registered("a", None)
+
+    async def test_slow_preempt_keeps_invariant(self):
+        sched, tasks, _, events, _ = self._setup(cancel_delay=0.1)
+        sched.preempt_warn_seconds = 0.01
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+
+        registered = []
+        seen = {}
+
+        async def user_turn():
+            events.append("user_start")
+
+        async def user_input():
+            await sched.preempt_for_user("a")
+            seen["proactive_done_at_create"] = proactive.done()
+            user = asyncio.create_task(user_turn())
+            tasks["a"] = user
+            registered.append(user)
+            sched.user_turn_registered("a", user)
+
+        violations = []
+        samples = 0
+        with _LoguruCapture(level="ERROR") as records:
+            flow = asyncio.create_task(user_input())
+            while not flow.done():
+                samples += 1
+                if not proactive.done() and registered:
+                    violations.append(samples)
+                await asyncio.sleep(0.005)
+            await flow
+        await _drain(registered[0])
+
+        self.assertGreater(samples, 5)
+        self.assertEqual(violations, [])
+        self.assertTrue(
+            any("preempt still waiting" in r and "uid=a" in r for r in records),
+            records,
+        )
+        self.assertTrue(seen["proactive_done_at_create"])
+        self.assertTrue(proactive.cancelled())
+        start = events.index("user_start")
+        self.assertNotIn("proactive_out", events[start:])
+        self.assertFalse(sched.presences["a"].reserved)
+
+    async def test_frontend_interrupt_not_ignored(self):
+        sched, tasks, mono, _, brain_events = self._setup()
+        sched.request_proactive("a")
+        await asyncio.sleep(0.003)
+        tasks["a"].cancel()
+        await _drain(tasks["a"])
+        presence = sched.presences["a"]
+        self.assertIsNone(presence.awaiting_reply_since)
+        self.assertFalse(presence.reserved)
+
+        mono.t += 10 * 60
+        await sched.tick_once()
+        self.assertNotIn(BrainEvent.PROACTIVE_IGNORED, brain_events)
+        self.assertEqual(presence.ignored_count, 0)
+        await _cancel_and_drain(tasks["a"])
+
+    async def test_completed_and_unanswered_ignored_once(self):
+        sched, tasks, mono, _, brain_events = self._setup(returns=True)
+        sched.request_proactive("a")
+        await _drain(tasks["a"])
+        presence = sched.presences["a"]
+        self.assertEqual(presence.awaiting_reply_since, mono())
+
+        mono.t += 5 * 60
+        with _LoguruCapture(level="INFO"):
+            await sched.tick_once()
+        self.assertEqual(brain_events.count(BrainEvent.PROACTIVE_IGNORED), 1)
+        self.assertEqual(presence.ignored_count, 1)
+
+        mono.t += 10 * 60
+        await sched.tick_once()
+        self.assertEqual(brain_events.count(BrainEvent.PROACTIVE_IGNORED), 1)
+        self.assertEqual(presence.ignored_count, 1)
+        await _drain(tasks["a"])
+
+    async def test_disconnect_during_preempt_wait(self):
+        sched, tasks, _, _, _ = self._setup(cancel_delay=0.05)
+        await sched.client_connected("a")
+        self.assertTrue(sched.is_running)
+        sched.request_proactive("a")
+        proactive = tasks["a"]
+        await asyncio.sleep(0.003)
+
+        preempt = asyncio.create_task(sched.preempt_for_user("a"))
+        await asyncio.sleep(0.01)
+        self.assertFalse(preempt.done())
+        await sched.client_disconnected("a")
+        await preempt  # must not raise
+
+        self.assertTrue(proactive.done())
+        self.assertNotIn("a", sched.presences)
+        self.assertFalse(sched.is_running)
+        sched.user_turn_registered("a", None)  # missing presence: no-op
+
+    async def test_registered_none_clears_pending(self):
+        sched, *_ = self._setup()
+        presence = sched.presences["a"]
+        await sched.preempt_for_user("a")  # no proactive running
+        self.assertTrue(presence.user_turn_pending)
+        sched.user_turn_registered("a", None)
+        self.assertFalse(presence.user_turn_pending)
+        self.assertIsNone(presence.last_conversation_end)
+
+    async def test_missing_presence_is_noop(self):
+        sched, *_ = self._setup()
+        del sched.presences["a"]
+        await sched.preempt_for_user("a")
+        sched.user_turn_registered("a", None)
+        self.assertNotIn("a", sched.presences)
+
+    async def test_user_task_done_tolerates_removed_presence(self):
+        sched, *_ = self._setup()
+        presence = sched.presences["a"]
+
+        async def user_turn():
+            await asyncio.sleep(0.002)
+
+        user = asyncio.create_task(user_turn())
+        sched.user_turn_registered("a", user)
+        del sched.presences["a"]
+        await _drain(user)
+        self.assertIsNone(presence.last_conversation_end)
+
+    def test_preempt_does_not_take_lifecycle_lock(self):
+        src = inspect.getsource(BehaviorScheduler.preempt_for_user)
+        src += inspect.getsource(BehaviorScheduler.user_turn_registered)
+        for forbidden in ("_lock", "client_connected", "client_disconnected"):
+            self.assertNotIn(forbidden, src)
+
+
 if __name__ == "__main__":
     unittest.main()

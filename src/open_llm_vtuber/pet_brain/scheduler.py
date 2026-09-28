@@ -455,6 +455,71 @@ class BehaviorScheduler:
             presence.awaiting_reply_since = self._clock()
             brain.notify(BrainEvent.PROACTIVE_SPOKEN)
 
+    # ------------------------------------------------------------------
+    # User preemption (spec §8.6)
+    # ------------------------------------------------------------------
+
+    async def preempt_for_user(self, uid: str) -> None:
+        """Stop a running proactive turn before a user turn is created.
+
+        Waits without an upper bound until the proactive task has really
+        finished, so the user task never overlaps it. `preempt_warn_seconds`
+        is only a diagnostic threshold. Never touches `reserved` /
+        `proactive_task` (the proactive done-callback releases them), never
+        takes the lifecycle lock.
+        """
+
+        presence = self.presences.get(uid)
+        if presence is None:
+            return
+
+        presence.last_user_interaction = self._clock()
+        presence.ignored_count = 0
+        presence.awaiting_reply_since = None
+        presence.user_turn_pending = True
+
+        task = presence.proactive_task
+        if task is None:
+            return
+        if not task.done():
+            presence.proactive_preempted = True
+            task.cancel()
+
+        # `asyncio.wait` never cancels or abandons the task on timeout. Even an
+        # already-done task is awaited so its pending done-callback runs first.
+        done, _ = await asyncio.wait({task}, timeout=self.preempt_warn_seconds)
+        if not done:
+            logger.error(
+                f"[Proactive] preempt still waiting after "
+                f"{self.preempt_warn_seconds:g}s uid={uid}"
+            )
+            await asyncio.wait({task})
+
+        if self.presences.get(uid) is presence:
+            # A turn that finished normally just before the preemption may
+            # have set it in its done-callback; the user is answering now.
+            presence.awaiting_reply_since = None
+
+    def user_turn_registered(self, uid: str, task: Optional[asyncio.Task]) -> None:
+        """Called right after the user task was registered (spec §8.6)."""
+
+        presence = self.presences.get(uid)
+        if presence is None:
+            return
+        presence.user_turn_pending = False
+        if task is not None:
+            task.add_done_callback(
+                functools.partial(self._on_user_turn_done, uid, presence)
+            )
+
+    def _on_user_turn_done(
+        self, uid: str, presence: ClientPresence, task: asyncio.Task
+    ) -> None:
+        if self.presences.get(uid) is not presence:
+            # Client disconnected (or reconnected with a fresh presence).
+            return
+        presence.last_conversation_end = self._clock()
+
     async def _dispatch_idle(self, uid: str, emotion: Optional[str]) -> None:
         """Send an expression-only payload to this client (spec §8.9).
 
