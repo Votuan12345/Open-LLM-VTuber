@@ -1,9 +1,11 @@
 """Phase 3A desktop pet tests. Run from repo root: uv run python -m unittest tests.test_desktop_pet_phase3 -v"""
 
+import inspect
 import json
 import os
 import tempfile
 import unittest
+from datetime import datetime
 
 from loguru import logger
 from pydantic import ValidationError
@@ -20,6 +22,12 @@ from src.open_llm_vtuber.config_manager import (
 )
 from src.open_llm_vtuber.live2d_model import Live2dModel
 from src.open_llm_vtuber.pet_brain import BrainEvent, PetBrain
+from src.open_llm_vtuber.pet_brain import context as context_module
+from src.open_llm_vtuber.pet_brain.context import (
+    OWN_PROCESS_NAMES,
+    ContextSnapshot,
+    WindowsContextSensor,
+)
 from src.open_llm_vtuber.pet_brain.emotion_manager import EmotionManager
 from src.open_llm_vtuber.pet_brain.lifecycle import LifecyclePhase
 from src.open_llm_vtuber.service_context import ServiceContext
@@ -219,6 +227,111 @@ class InteractionPrimitiveTests(unittest.TestCase):
             self.assertEqual(
                 Live2dModel("plain_model", model_dict_path=path).motion_map, {}
             )
+
+
+class _FakeUser32:
+    """Minimal user32 stand-in for `_read_foreground_rect`."""
+
+    def __init__(self, rect=(10, 20, 810, 620), hwnd=100, iconic=0, rect_ok=True):
+        self.rect = rect
+        self.hwnd = hwnd
+        self.iconic = iconic
+        self.rect_ok = rect_ok
+        self.dpi_calls = []
+
+    def GetForegroundWindow(self):
+        return self.hwnd
+
+    def GetDesktopWindow(self):
+        return 1
+
+    def GetShellWindow(self):
+        return 2
+
+    def IsIconic(self, hwnd):
+        return self.iconic
+
+    def SetThreadDpiAwarenessContext(self, ctx):
+        self.dpi_calls.append(ctx)
+        return 17 if len(self.dpi_calls) == 1 else -4
+
+    def GetWindowRect(self, hwnd, rect_ref):
+        if self.rect_ok is None:
+            raise OSError("boom")
+        if not self.rect_ok:
+            return 0
+        r = rect_ref._obj
+        r.left, r.top, r.right, r.bottom = self.rect
+        return 1
+
+
+class _RectSensor(WindowsContextSensor):
+    def __init__(self, user32, process="Unity.exe"):
+        super().__init__(wall_clock=lambda: datetime(2024, 1, 1, 9, 0))
+        self._user32 = user32
+        self._process = process
+
+    def _read_idle_seconds(self) -> float:
+        return 3.0
+
+    def _read_process_name(self) -> str:
+        return self._process
+
+    def _read_fullscreen(self) -> bool:
+        return False
+
+
+class ForegroundRectTests(unittest.TestCase):
+    def _sample(self, user32, process="Unity.exe"):
+        with _LoguruCapture("DEBUG"):
+            return _RectSensor(user32, process).sample()
+
+    def test_rect_read(self):
+        snap = self._sample(_FakeUser32())
+        self.assertEqual(snap.foreground_rect, (10, 20, 810, 620))
+        self.assertEqual(snap.process_name, "Unity.exe")
+
+    def test_rect_none_cases(self):
+        cases = [
+            (_FakeUser32(iconic=1), "Unity.exe"),
+            (_FakeUser32(hwnd=1), "Unity.exe"),
+            (_FakeUser32(hwnd=2), "Unity.exe"),
+            (_FakeUser32(hwnd=0), "Unity.exe"),
+            (_FakeUser32(rect=(10, 10, 10, 300)), "Unity.exe"),
+            (_FakeUser32(), "open-llm-vtuber-electron.exe"),
+            (_FakeUser32(), "Electron.exe"),
+            (_FakeUser32(rect_ok=False), "Unity.exe"),
+            (_FakeUser32(rect_ok=None), "Unity.exe"),
+        ]
+        for user32, process in cases:
+            snap = self._sample(user32, process)
+            self.assertIsNone(snap.foreground_rect, (user32.__dict__, process))
+            self.assertEqual(snap.user_idle_seconds, 3.0)
+            self.assertFalse(snap.fullscreen)
+
+    def test_dpi_context_restored(self):
+        ok = _FakeUser32()
+        self._sample(ok)
+        self.assertEqual(ok.dpi_calls, [-4, 17])
+
+        failing = _FakeUser32(rect_ok=None)
+        self._sample(failing)
+        self.assertEqual(failing.dpi_calls, [-4, 17])
+
+    def test_missing_dpi_api_still_reads(self):
+        user32 = _FakeUser32()
+        user32.SetThreadDpiAwarenessContext = None
+        self.assertEqual(self._sample(user32).foreground_rect, (10, 20, 810, 620))
+
+    def test_unknown_has_no_rect(self):
+        self.assertIsNone(ContextSnapshot.unknown(datetime(2024, 1, 1)).foreground_rect)
+
+    def test_own_process_names(self):
+        self.assertIn("open-llm-vtuber-electron.exe", OWN_PROCESS_NAMES)
+        self.assertIn("electron.exe", OWN_PROCESS_NAMES)
+
+    def test_no_window_text_api(self):
+        self.assertNotIn("GetWindowText", inspect.getsource(context_module))
 
 
 if __name__ == "__main__":

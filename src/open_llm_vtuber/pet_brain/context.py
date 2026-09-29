@@ -1,8 +1,9 @@
 """Context snapshot and a Windows desktop-metadata sensor.
 
 Only lightweight metadata is read: user input idle time, the foreground
-process's executable name, and whether that window is fullscreen. Window
-titles are never read.
+process's executable name, whether that window is fullscreen, and its
+rectangle (geometry only, for contextual movement). Window titles are never
+read.
 """
 
 import ctypes
@@ -11,12 +12,16 @@ import sys
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Mapping, Optional, Protocol
+from typing import Mapping, Optional, Protocol, Tuple
 
 from loguru import logger
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MONITOR_DEFAULTTONEAREST = 2
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+
+# Mili's own Electron window never counts as the "foreground app" rectangle.
+OWN_PROCESS_NAMES = frozenset({"open-llm-vtuber-electron.exe", "electron.exe"})
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,8 @@ class ContextSnapshot:
     user_idle_seconds: Optional[float]
     process_name: Optional[str]
     fullscreen: Optional[bool]
+    # (left, top, right, bottom) in physical pixels; used only for movement.
+    foreground_rect: Optional[Tuple[int, int, int, int]] = None
 
     @classmethod
     def unknown(cls, now_wall: datetime) -> "ContextSnapshot":
@@ -123,6 +130,13 @@ class WindowsContextSensor:
                 ctypes.POINTER(_MONITORINFO),
             ]
             user32.GetMonitorInfoW.restype = wintypes.BOOL
+            user32.IsIconic.argtypes = [wintypes.HWND]
+            user32.IsIconic.restype = wintypes.BOOL
+            try:
+                user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+                user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+            except AttributeError:
+                pass  # older Windows: rect is read without a DPI switch
             self._user32 = user32
         return self._user32
 
@@ -208,6 +222,40 @@ class WindowsContextSensor:
             and rect.bottom >= mon.bottom
         )
 
+    def _read_foreground_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        """Foreground window rectangle in physical pixels, or `None`.
+
+        The calling thread is switched to per-monitor-v2 DPI awareness for the
+        `GetWindowRect` call only, so the result is in physical pixels.
+        """
+
+        user32 = self._get_user32()
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        if hwnd in (user32.GetDesktopWindow(), user32.GetShellWindow()):
+            return None
+        if user32.IsIconic(hwnd):
+            return None
+        if self._read_process_name().casefold() in OWN_PROCESS_NAMES:
+            return None
+
+        set_dpi = getattr(user32, "SetThreadDpiAwarenessContext", None)
+        previous = (
+            set_dpi(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) if set_dpi else None
+        )
+        try:
+            rect = _RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+        finally:
+            if set_dpi and previous:
+                set_dpi(previous)
+
+        if rect.right <= rect.left or rect.bottom <= rect.top:
+            return None
+        return (rect.left, rect.top, rect.right, rect.bottom)
+
     def sample(self) -> ContextSnapshot:
         now_wall = self._wall_clock()
 
@@ -229,11 +277,18 @@ class WindowsContextSensor:
             logger.debug(f"[Context] fullscreen read failed: {exc}")
             fullscreen = None
 
+        try:
+            foreground_rect = self._read_foreground_rect()
+        except Exception as exc:
+            logger.debug(f"[Context] foreground rect read failed: {exc}")
+            foreground_rect = None
+
         return ContextSnapshot(
             taken_at_wall=now_wall,
             user_idle_seconds=idle_seconds,
             process_name=process_name,
             fullscreen=fullscreen,
+            foreground_rect=foreground_rect,
         )
 
 
