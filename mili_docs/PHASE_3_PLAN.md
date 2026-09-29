@@ -21,7 +21,9 @@
 - Backend tests: stdlib `unittest` in `tests/test_desktop_pet_phase3.py`. Run with `uv run python -m unittest tests.test_desktop_pet_phase3 -v`. Inject clock, sensor and `random.Random`; no real sleeps longer than a few ms.
 - Phase 1 + 2 suites stay green: `uv run python -m unittest tests.test_pet_brain tests.test_behavior_phase2` (228 tests).
 - `ruff check .` must be clean, and `ruff format` clean on every changed backend file.
-- Frontend: `npm run typecheck`, `npm run lint` and `npx vitest run` pass. The only new dependency is `vitest` (dev).
+- Frontend: `npm run typecheck:mili` and `npm test` pass. The only new dependency is `vitest@^2.1.9` (dev; vitest 3+ needs vite 6, the project is on vite 5).
+  - Upstream `npm run typecheck` already fails (582 errors in the vendored WebSDK + 4 unused-symbol errors). `typecheck:mili` (Task 0) fails only on errors outside that baseline.
+  - Upstream `npm run lint` is broken (`.eslintrc.js` extends `airbnb`, which is not installed). Lint is **not** a gate; do not fix it in Phase 3A.
 - Do not touch:
   - the backend `frontend/` submodule, `conf.yaml`, ASR/TTS/VAD, MCP, agents, memory, `upgrade_codes/`;
   - `src/renderer/WebSDK/**` in the frontend.
@@ -83,7 +85,7 @@
 
 ---
 
-### Task 0: Frontend repository and toolchain setup
+### Task 0: Frontend repository and toolchain setup — DONE (`6177ab3` in the frontend repo)
 
 **Blocked on the user:** the GitHub fork `Votuan12345/Open-LLM-VTuber-Web` must exist, and Node.js 20 or 22 LTS must be installed. Do not create either one yourself.
 
@@ -336,7 +338,7 @@
   - `pet-settings.test.ts`: defaults (true, null); round trip; a storage whose methods throw → defaults and no throw; a `null` storage works in memory.
 - [ ] **Step 2: Run** `npm test`. Expect FAIL (modules missing).
 - [ ] **Step 3: Implement** the four modules with no imports from React, Electron or the WebSDK.
-- [ ] **Step 4: Run** `npm test && npm run typecheck`. Expect PASS.
+- [ ] **Step 4: Run** `npm test && npm run typecheck:mili`. Expect PASS.
 - [ ] **Step 5: Commit** (frontend) `feat(pet): protocol, geometry, motion and settings modules`.
 
 ---
@@ -365,7 +367,7 @@
   - `targets use the display containing the box centre` (the box on the second display stays there).
 - [ ] **Step 2: Run** `npm test`. Expect FAIL.
 - [ ] **Step 3: Implement `planTarget`** following spec §7.3. The "reset home" side effect is **not** in the planner; the controller does it on `home_invalid`.
-- [ ] **Step 4: Run** `npm test && npm run typecheck`. Expect PASS.
+- [ ] **Step 4: Run** `npm test && npm run typecheck:mili`. Expect PASS.
 - [ ] **Step 5: Commit** (frontend) `feat(pet): movement planner`.
 
 ---
@@ -404,7 +406,7 @@
 - [ ] **Step 3: Implement** `pet-ipc.ts` (with `screen.screenToDipRect(null, rect)` inside try/catch → `null`), the preload bindings and typings, the menu checkbox, `hover-store.ts` and the controller.
   - The move loop: interpolate the box top-left in DIP with `easeInOutSine`, add `bobOffset` to y, and convert the DIP delta from the start position into a logical delta applied to the start logical position.
   - The hover refresh uses `now()` throttling at 100 ms plus a final check after arrival or cancel.
-- [ ] **Step 4: Run** `npm test && npm run typecheck && npm run lint`. Expect PASS.
+- [ ] **Step 4: Run** `npm test && npm run typecheck:mili`. Expect PASS.
 - [ ] **Step 5: Commit** (frontend) `feat(pet): desktop pet controller, main-process IPC and movement toggle`.
 
 ---
@@ -438,7 +440,7 @@
   - Builds the controller with real deps; forwards mode, the AI state (`thinking-speaking`/`listening` → busy), the tray toggle (`onToggleMovement` → settings → `reportMovementState` → `pet-status`) and layout changes.
   - Sends `pet-interaction` only in Pet Mode when the ws is open.
   - Disposes everything on unmount.
-- [ ] **Step 4: Verify.** Run `npm run typecheck && npm run lint && npm test`. Expect PASS. Then run `npm run dev` with the backend running and PetBrain disabled: the app works as before (window mode, pet mode, drag, tap motion, chat), and in the console `pet-hello` is sent with no errors.
+- [ ] **Step 4: Verify.** Run `npm run typecheck:mili && npm test`. Expect PASS. Then run `npm run dev` with the backend running and PetBrain disabled: the app works as before (window mode, pet mode, drag, tap motion, chat), and in the console `pet-hello` is sent with no errors.
 - [ ] **Step 5: Commit** (frontend) `feat(pet): wire desktop pet into renderer, websocket and Live2D interactions`.
 
 ---
