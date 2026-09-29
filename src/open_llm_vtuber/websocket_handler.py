@@ -45,6 +45,7 @@ class MessageType(Enum):
     CONFIG = ["fetch-configs", "switch-config"]
     CONTROL = ["interrupt-signal", "audio-play-start"]
     DATA = ["mic-audio-data"]
+    PET = ["pet-hello", "pet-status", "pet-interaction"]
 
 
 class WSMessage(TypedDict, total=False):
@@ -105,6 +106,9 @@ class WebSocketHandler:
             "audio-play-start": self._handle_audio_play_start,
             "request-init-config": self._handle_init_config_request,
             "heartbeat": self._handle_heartbeat,
+            "pet-hello": self._handle_pet_message,
+            "pet-status": self._handle_pet_message,
+            "pet-interaction": self._handle_pet_message,
         }
 
     async def handle_new_connection(
@@ -617,6 +621,12 @@ class WebSocketHandler:
                 }
             )
         )
+
+    async def _handle_pet_message(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Mili desktop pet messages (Phase 3); the scheduler validates and owns them."""
+        await self.behavior_scheduler.handle_pet_message(client_uid, data)
 
     async def _handle_heartbeat(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

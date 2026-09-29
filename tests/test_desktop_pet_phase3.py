@@ -5,8 +5,11 @@ import json
 import os
 import tempfile
 import copy
+import random
 import unittest
 from collections import deque
+from types import SimpleNamespace
+from unittest import mock
 from dataclasses import replace
 from datetime import datetime
 
@@ -47,7 +50,11 @@ from src.open_llm_vtuber.pet_brain.desktop_pet import (
 )
 from src.open_llm_vtuber.pet_brain.emotion_manager import EmotionManager
 from src.open_llm_vtuber.pet_brain.lifecycle import LifecyclePhase
+from src.open_llm_vtuber.pet_brain.mood import Mood, MoodState
+from src.open_llm_vtuber.pet_brain.presence import ClientPresence
+from src.open_llm_vtuber.pet_brain.scheduler import BehaviorScheduler
 from src.open_llm_vtuber.service_context import ServiceContext
+from src.open_llm_vtuber.websocket_handler import WebSocketHandler
 
 MAO_MODEL = Live2dModel("mao_pro")
 
@@ -735,6 +742,395 @@ class ReactionTests(unittest.TestCase):
             ("play_motion", {"group": "", "index": 3}),
         )
         self.assertIsNone(movement_command(PetDecision(PetKind.STAY, "nothing_to_do")))
+
+
+# ----------------------------------------------------------------------
+# Scheduler pet lane (Task 5)
+# ----------------------------------------------------------------------
+
+_WALL = datetime(2024, 6, 15, 14, 0)
+PET_MOOD = dict(
+    happiness=0.6,
+    energy=0.7,
+    curiosity=0.5,
+    boredom=0.8,
+    social_need=0.4,
+    focus=0.3,
+    sleepiness=0.1,
+)
+HELLO = {"type": "pet-hello", "protocol": 1, "mode": "pet", "movement_enabled": True}
+
+
+class _Clock:
+    def __init__(self, t=100_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class _Sensor:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def sample(self):
+        return self.snapshot
+
+
+class _WS:
+    def __init__(self):
+        self.messages = []
+
+    async def send_text(self, message):
+        self.messages.append(message)
+
+
+class _NoGroups:
+    def get_client_group(self, uid):
+        return None
+
+
+class _RunningTask:
+    def done(self):
+        return False
+
+
+async def _noop_turn(context, websocket_send, client_uid, context_block):
+    return None
+
+
+def _snap(idle=300.0, process="chrome.exe", fullscreen=False, rect=(0, 0, 800, 600)):
+    return ContextSnapshot(
+        taken_at_wall=_WALL,
+        user_idle_seconds=idle,
+        process_name=process,
+        fullscreen=fullscreen,
+        foreground_rect=rect,
+    )
+
+
+def make_pet_scheduler(
+    snapshot=None,
+    desktop_pet=True,
+    brain_present=True,
+    idle_expression=False,
+    mood=None,
+    motion_map=None,
+):
+    clock = _Clock()
+    cfg = PetBrainConfig(enabled=True)
+    cfg.proactive.enabled = False
+    cfg.idle_expression.enabled = idle_expression
+    cfg.context.away_after_min = 30
+    cfg.desktop_pet.enabled = desktop_pet
+    brain = PetBrain(cfg, clock=clock, wall_clock=lambda: _WALL)
+    brain.mood = Mood(
+        initial=MoodState(**(mood or PET_MOOD)), clock=clock, wall_clock=lambda: _WALL
+    )
+    ws = _WS()
+    model = SimpleNamespace(
+        emo_map=dict(MAO_MODEL.emo_map), motion_map=dict(motion_map or {})
+    )
+    contexts = {
+        "a": SimpleNamespace(
+            pet_brain=brain if brain_present else None, live2d_model=model
+        )
+    }
+    tasks = {}
+    sched = BehaviorScheduler(
+        {"a": ws},
+        contexts,
+        tasks,
+        _NoGroups(),
+        run_proactive_turn=_noop_turn,
+        sensor=_Sensor(snapshot or _snap()),
+        clock=clock,
+        rng=random.Random(0),
+        wall_clock=lambda: _WALL,
+    )
+    sched.presences["a"] = ClientPresence(uid="a", connected_at=0.0)
+    sched.pet_selector = PetSelector(_FixedRng(0.1))
+    return sched, ws, brain, clock, tasks
+
+
+def _sent(ws, msg_type):
+    return [m for m in map(json.loads, ws.messages) if m.get("type") == msg_type]
+
+
+class PetLaneTests(unittest.IsolatedAsyncioTestCase):
+    async def test_no_hello_no_commands(self):
+        outputs = []
+        for desktop_pet in (True, False):
+            sched, ws, _, clock, _ = make_pet_scheduler(
+                desktop_pet=desktop_pet, idle_expression=True
+            )
+            for _ in range(5):
+                await sched.tick_once()
+                clock.t += 20
+            outputs.append(ws.messages)
+            self.assertEqual(_sent(ws, "pet-command"), [])
+        self.assertEqual(outputs[0], outputs[1])
+
+    async def test_hello_then_wander_sends_command(self):
+        sched, ws, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        await sched.tick_once()
+        cmds = _sent(ws, "pet-command")
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0]["command"], "wander")
+        self.assertEqual(cmds[0]["params"], {"distance": "long", "speed": "normal"})
+        self.assertTrue(cmds[0]["id"].startswith("c-"))
+        p = sched.pet_presences["a"]
+        self.assertTrue(p.moving)
+        self.assertEqual(p.pending_command_id, cmds[0]["id"])
+
+    async def test_status_result_clears_pending(self):
+        sched, ws, _, clock, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        await sched.tick_once()
+        cid = _sent(ws, "pet-command")[0]["id"]
+        status = {
+            "type": "pet-status",
+            "mode": "pet",
+            "movement_enabled": True,
+            "moving": False,
+            "anchor": "edge",
+            "result": "arrived",
+        }
+        await sched.handle_pet_message("a", dict(status, command_id="c-999"))
+        p = sched.pet_presences["a"]
+        self.assertTrue(p.moving)
+        clock.t += 5
+        await sched.handle_pet_message("a", dict(status, command_id=cid))
+        self.assertFalse(p.moving)
+        self.assertIsNone(p.pending_command_id)
+        self.assertEqual(p.anchor, "edge")
+        self.assertEqual(p.last_move, clock.t)
+
+    async def test_status_updates_mode_and_toggle(self):
+        sched, ws, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        await sched.handle_pet_message(
+            "a",
+            {
+                "type": "pet-status",
+                "mode": "window",
+                "movement_enabled": False,
+                "moving": False,
+            },
+        )
+        p = sched.pet_presences["a"]
+        self.assertEqual((p.mode, p.movement_enabled), ("window", False))
+        await sched.tick_once()
+        self.assertEqual(_sent(ws, "pet-command"), [])
+
+    async def test_pending_command_times_out(self):
+        sched, ws, _, clock, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        await sched.tick_once()
+        clock.t += 61
+        with _LoguruCapture("WARNING") as logs:
+            await sched.tick_once()
+        p = sched.pet_presences["a"]
+        self.assertIsNone(p.pending_command_id)
+        self.assertFalse(p.moving)
+        self.assertTrue(any("timeout" in r for r in logs))
+        self.assertEqual(len(_sent(ws, "pet-command")), 1)
+        clock.t += 5 * 60
+        await sched.tick_once()
+        self.assertEqual(len(_sent(ws, "pet-command")), 2)
+
+    async def test_lane_skipped_when_conversation_running_or_reserved(self):
+        sched, ws, _, _, tasks = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        tasks["a"] = _RunningTask()
+        await sched.tick_once()
+        self.assertEqual(_sent(ws, "pet-command"), [])
+        tasks["a"] = None
+        sched.presences["a"].reserved = True
+        await sched.tick_once()
+        self.assertEqual(_sent(ws, "pet-command"), [])
+
+    async def test_category_changed_flag(self):
+        sched, _, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        await sched.tick_once()
+        p = sched.pet_presences["a"]
+        self.assertFalse(p.category_changed)
+        self.assertEqual(p.last_category, "browser")
+        sched.sensor.snapshot = _snap(process="Unity.exe")
+        await sched.tick_once()
+        self.assertTrue(p.category_changed)
+        await sched.tick_once()
+        self.assertFalse(p.category_changed)
+
+    async def test_user_returned_goes_home(self):
+        sched, ws, _, _, _ = make_pet_scheduler(snapshot=_snap(idle=5.0))
+        await sched.handle_pet_message("a", HELLO)
+        sched.state.previous_user_idle_seconds = 3600.0
+        await sched.tick_once()
+        cmds = _sent(ws, "pet-command")
+        self.assertEqual([c["command"] for c in cmds], ["go_home"])
+        self.assertFalse(sched.pet_presences["a"].returned_pending)
+
+    async def test_contextual_approach_sends_rect(self):
+        mood = dict(PET_MOOD, curiosity=0.6)
+        sched, ws, _, _, _ = make_pet_scheduler(mood=mood)
+        sched.pet_selector = PetSelector(_FixedRng(0.99))
+        await sched.handle_pet_message("a", HELLO)
+        await sched.tick_once()
+        sched.sensor.snapshot = _snap(
+            idle=300.0, process="Unity.exe", rect=(10, 20, 110, 220)
+        )
+        await sched.tick_once()
+        cmds = _sent(ws, "pet-command")
+        self.assertEqual(cmds[-1]["command"], "approach_rect")
+        self.assertEqual(
+            cmds[-1]["params"],
+            {"rect": {"x": 10, "y": 20, "width": 100, "height": 200}},
+        )
+        self.assertEqual(sched.pet_presences["a"].last_contextual, sched._clock())
+
+    async def test_disconnect_drops_pet_presence(self):
+        sched, _, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        self.assertIn("a", sched.pet_presences)
+        await sched.client_disconnected("a")
+        self.assertNotIn("a", sched.pet_presences)
+
+    async def test_disabled_backend_ignores_pet_messages(self):
+        for kwargs in ({"brain_present": False}, {"desktop_pet": False}):
+            sched, ws, _, _, _ = make_pet_scheduler(**kwargs)
+            await sched.handle_pet_message("a", HELLO)
+            await sched.handle_pet_message(
+                "a", {"type": "pet-interaction", "kind": "click"}
+            )
+            await sched.tick_once()
+            self.assertEqual(ws.messages, [], kwargs)
+
+    async def test_invalid_message_is_dropped(self):
+        sched, ws, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", {"type": "pet-hello", "protocol": "x"})
+        await sched.handle_pet_message("a", {"type": "pet-interaction", "kind": "kick"})
+        self.assertNotIn("a", sched.pet_presences)
+        self.assertEqual(ws.messages, [])
+
+    async def test_unknown_client_is_ignored(self):
+        sched, ws, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("zzz", HELLO)
+        self.assertNotIn("zzz", sched.pet_presences)
+
+
+class PetInteractionTests(unittest.IsolatedAsyncioTestCase):
+    async def _setup(self, **kwargs):
+        sched, ws, brain, clock, tasks = make_pet_scheduler(**kwargs)
+        await sched.handle_pet_message("a", HELLO)
+        return sched, ws, brain, clock, tasks
+
+    @staticmethod
+    def _click(kind="click"):
+        return {"type": "pet-interaction", "kind": kind, "hit_area": None}
+
+    async def test_click_reaction_expression(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        before = brain.mood.snapshot()["boredom"]
+        await sched.handle_pet_message("a", self._click())
+        payloads = _sent(ws, "audio")
+        self.assertEqual(len(payloads), 1)
+        self.assertIsNone(payloads[0]["audio"])
+        self.assertEqual(payloads[0]["actions"], {"expressions": [3]})
+        self.assertAlmostEqual(brain.mood.snapshot()["boredom"], before - 0.05)
+        self.assertEqual(sched.presences["a"].last_user_interaction, clock.t)
+        self.assertEqual(brain.emotion.current_emotion, "joy")
+
+    async def test_reaction_cooldown(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        before = brain.mood.snapshot()["boredom"]
+        await sched.handle_pet_message("a", self._click())
+        clock.t += 1
+        await sched.handle_pet_message("a", self._click())
+        self.assertEqual(len(_sent(ws, "audio")), 1)
+        self.assertAlmostEqual(brain.mood.snapshot()["boredom"], before - 0.10)
+        clock.t += 3
+        await sched.handle_pet_message("a", self._click())
+        self.assertEqual(len(_sent(ws, "audio")), 2)
+
+    async def test_click_spam(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        for dt in (0, 1, 1, 1.5, 0.5):
+            clock.t += dt
+            await sched.handle_pet_message("a", self._click())
+        payloads = _sent(ws, "audio")
+        self.assertEqual(payloads[-1]["actions"], {"expressions": [2]})
+        self.assertEqual(brain.emotion.current_emotion, "anger")
+
+    async def test_double_click_wakes_stops_and_pauses(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        await sched.tick_once()
+        self.assertTrue(sched.pet_presences["a"].moving)
+        brain.lifecycle.phase = LifecyclePhase.SLEEP
+        await sched.handle_pet_message("a", self._click("double_click"))
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.ACTIVE)
+        cmds = _sent(ws, "pet-command")
+        self.assertEqual(cmds[-1]["command"], "stop")
+        self.assertEqual(sched.pet_presences["a"].paused_until, clock.t + 180)
+        self.assertEqual(_sent(ws, "audio")[-1]["actions"], {"expressions": [3]})
+
+    async def test_drag_end_pauses_and_sets_home_anchor(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        await sched.handle_pet_message("a", self._click("drag_start"))
+        self.assertEqual(_sent(ws, "audio"), [])
+        await sched.handle_pet_message("a", self._click("drag_end"))
+        p = sched.pet_presences["a"]
+        self.assertEqual(p.paused_until, clock.t + 300)
+        self.assertEqual(p.anchor, "home")
+        self.assertEqual(brain.emotion.current_emotion, "smirk")
+
+    async def test_no_expression_during_conversation_or_sleep(self):
+        sched, ws, brain, clock, tasks = await self._setup()
+        tasks["a"] = _RunningTask()
+        before = brain.mood.snapshot()["boredom"]
+        await sched.handle_pet_message("a", self._click())
+        self.assertEqual(_sent(ws, "audio"), [])
+        self.assertAlmostEqual(brain.mood.snapshot()["boredom"], before - 0.05)
+
+        tasks["a"] = None
+        brain.lifecycle.phase = LifecyclePhase.SLEEP
+        clock.t += 10
+        await sched.handle_pet_message("a", self._click())
+        self.assertEqual(_sent(ws, "audio"), [])
+
+    async def test_interaction_rate_limit(self):
+        sched, _, brain, _, _ = await self._setup()
+        before = brain.mood.snapshot()["boredom"]
+        for _ in range(25):
+            await sched.handle_pet_message("a", self._click("drag_end"))
+        self.assertAlmostEqual(brain.mood.snapshot()["boredom"], before - 0.5)
+
+    async def test_idle_motion_dispatch(self):
+        mood = dict(PET_MOOD, sleepiness=0.65, boredom=0.1)
+        sched, ws, _, clock, _ = await self._setup(
+            mood=mood, motion_map={"yawn": {"group": "", "index": 3}}
+        )
+        await sched.tick_once()
+        cmds = _sent(ws, "pet-command")
+        self.assertEqual(len(cmds), 1)
+        self.assertEqual(cmds[0]["command"], "play_motion")
+        self.assertEqual(cmds[0]["params"], {"group": "", "index": 3})
+        p = sched.pet_presences["a"]
+        self.assertFalse(p.moving)
+        self.assertEqual(p.last_idle_motion, clock.t)
+
+
+class WebSocketRoutingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pet_messages_route_to_scheduler(self):
+        handler = WebSocketHandler(SimpleNamespace())
+        handler.behavior_scheduler.handle_pet_message = mock.AsyncMock()
+        for msg_type in ("pet-hello", "pet-status", "pet-interaction"):
+            data = {"type": msg_type}
+            await handler._route_message(None, "a", data)
+            handler.behavior_scheduler.handle_pet_message.assert_awaited_with("a", data)
+        self.assertEqual(handler.behavior_scheduler.handle_pet_message.await_count, 3)
 
 
 if __name__ == "__main__":

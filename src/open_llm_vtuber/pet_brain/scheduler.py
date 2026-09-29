@@ -15,7 +15,7 @@ import json
 import random
 import time
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -34,8 +34,22 @@ from .context import (
     classify_process,
     make_default_sensor,
 )
+from .desktop_pet import (
+    PetDecision,
+    PetHello,
+    PetInteraction,
+    PetKind,
+    PetPresence,
+    PetSelectionInput,
+    PetSelector,
+    PetStatus,
+    choose_reaction,
+    movement_command,
+    parse_pet_message,
+)
 from .eligibility import ClientEligibility
 from .events import BrainEvent
+from .lifecycle import LifecyclePhase
 from .pet_brain import ActivityState, BrainTickInputs, PetBrain
 from .presence import ClientPresence, SchedulerState, prune_window
 from .proactive_prompt import build_context_block
@@ -43,6 +57,9 @@ from .rhythm import day_part_at
 
 # `user_returned` fires when the current known idle drops below this (spec §7.3).
 RETURNED_IDLE_BELOW_S = 30.0
+
+# Inbound `pet-interaction` rate limit per client (Phase 3 spec §5.3).
+PET_INTERACTION_MAX_PER_S = 10
 
 RunProactiveTurn = Callable[
     [Any, Callable[[str], Awaitable[None]], str, str], Awaitable[None]
@@ -87,6 +104,10 @@ class BehaviorScheduler:
 
         self.presences: Dict[str, ClientPresence] = {}
         self.state = SchedulerState()
+        # Phase 3A desktop pet lane: only clients that sent `pet-hello`.
+        self.pet_presences: Dict[str, PetPresence] = {}
+        self.pet_selector = PetSelector(self.rng)
+        self._pet_command_seq = 0
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
@@ -111,6 +132,7 @@ class BehaviorScheduler:
     async def client_disconnected(self, uid: str) -> None:
         async with self._lock:
             self.presences.pop(uid, None)
+            self.pet_presences.pop(uid, None)
             if self.presences or self._task is None:
                 return
             task = self._task
@@ -165,6 +187,8 @@ class BehaviorScheduler:
         self._detect_ignored(handled, now)
 
         await self._select_and_dispatch(now, ctx)
+
+        await self._pet_lane(now)
 
     def _log_context_label(self, ctx: ContextSnapshot, handled: List[str]) -> None:
         # Label uses the most relevant handled client's brain table.
@@ -236,6 +260,10 @@ class BehaviorScheduler:
             for p in presences:
                 p.returned_bonus_pending = True
                 p.returned_after_s = prev_idle
+            for uid in uids:
+                pet = self.pet_presences.get(uid)
+                if pet is not None:
+                    pet.returned_pending = True
 
     def _task_running(self, uid: str) -> bool:
         task = self.current_conversation_tasks.get(uid)
@@ -322,15 +350,7 @@ class BehaviorScheduler:
             return Decision(BehaviorKind.DO_NOTHING, "not_connected")
 
         brain = self.eligibility.brain_for(uid)
-        last = self.state.last_context
-        if last is None or not brain.config.context.enabled:
-            wall = last.taken_at_wall if last is not None else self._wall_clock()
-            ctx = ContextSnapshot.unknown(wall)
-        else:
-            ctx = last
-        category = classify_process(
-            ctx.process_name, brain.config.context.process_categories
-        )
+        ctx, category = self._context_for(brain)
 
         live2d_model = getattr(self.client_contexts.get(uid), "live2d_model", None)
         emo_map = getattr(live2d_model, "emo_map", None) or {}
@@ -378,6 +398,20 @@ class BehaviorScheduler:
             if not committed:
                 return Decision(BehaviorKind.DO_NOTHING, "conversation_lock")
         return d
+
+    def _context_for(self, brain: PetBrain) -> Tuple[ContextSnapshot, Optional[str]]:
+        """Last sampled context as seen by `brain` (unknown if its context is disabled)."""
+
+        last = self.state.last_context
+        if last is None or not brain.config.context.enabled:
+            wall = last.taken_at_wall if last is not None else self._wall_clock()
+            ctx = ContextSnapshot.unknown(wall)
+        else:
+            ctx = last
+        category = classify_process(
+            ctx.process_name, brain.config.context.process_categories
+        )
+        return ctx, category
 
     def _commit_proactive(
         self,
@@ -558,3 +592,263 @@ class BehaviorScheduler:
             await websocket.send_text(json.dumps(payload))
         except Exception as e:
             logger.debug(f"[Behavior] idle expression send failed uid={uid}: {e}")
+
+    # ------------------------------------------------------------------
+    # Desktop pet lane (Phase 3 spec §5, §6)
+    # ------------------------------------------------------------------
+
+    def _pet_brain(self, uid: str) -> Optional[PetBrain]:
+        """Brain for a handled client whose `desktop_pet` is enabled, else `None`."""
+
+        if not self.eligibility.handles(uid):
+            return None
+        brain = self.eligibility.brain_for(uid)
+        if brain is None or not brain.config.desktop_pet.enabled:
+            return None
+        return brain
+
+    async def handle_pet_message(self, uid: str, data: dict) -> None:
+        """Single entry point for `pet-hello`, `pet-status` and `pet-interaction`."""
+
+        if uid not in self.presences:
+            logger.debug(f"[Pet] message from unknown client uid={uid} ignored")
+            return
+        msg = parse_pet_message(data)
+        if msg is None:
+            logger.debug(f"[Pet] invalid message dropped uid={uid}: {data!r:.200}")
+            return
+
+        if isinstance(msg, PetHello):
+            self.pet_presences[uid] = PetPresence(
+                protocol=msg.protocol,
+                mode=msg.mode,
+                movement_enabled=msg.movement_enabled,
+            )
+            logger.info(
+                f"[Pet] hello uid={uid} protocol={msg.protocol} mode={msg.mode} "
+                f"movement={msg.movement_enabled}"
+            )
+            return
+
+        pet = self.pet_presences.get(uid)
+        if pet is None:
+            logger.debug(f"[Pet] {data.get('type')} before pet-hello uid={uid} ignored")
+            return
+
+        if isinstance(msg, PetStatus):
+            self._apply_pet_status(uid, pet, msg)
+            return
+
+        now = self._clock()
+        prune_window(pet.message_times, now, window_s=1.0)
+        if len(pet.message_times) >= PET_INTERACTION_MAX_PER_S:
+            logger.debug(f"[Pet] interaction rate limit uid={uid}")
+            return
+        pet.message_times.append(now)
+        await self._handle_interaction(uid, msg)
+
+    def _apply_pet_status(self, uid: str, pet: PetPresence, msg: PetStatus) -> None:
+        pet.mode = msg.mode
+        pet.movement_enabled = msg.movement_enabled
+        if msg.anchor is not None:
+            pet.anchor = msg.anchor
+        if msg.result is None:
+            return
+        if msg.command_id is None or msg.command_id != pet.pending_command_id:
+            logger.debug(
+                f"[Pet] result for stale command id={msg.command_id} uid={uid} ignored"
+            )
+            return
+        pet.pending_command_id = None
+        pet.pending_since = None
+        pet.moving = False
+        if msg.result == "arrived":
+            pet.last_move = self._clock()
+        reason = f" ({msg.reason})" if msg.reason else ""
+        logger.info(
+            f"[Pet] result id={msg.command_id} {msg.result}{reason} anchor={pet.anchor}"
+        )
+
+    async def _handle_interaction(self, uid: str, msg: PetInteraction) -> None:
+        brain = self._pet_brain(uid)
+        pet = self.pet_presences.get(uid)
+        if brain is None or pet is None:
+            return
+        cfg = brain.config.desktop_pet.interaction
+        if not cfg.enabled:
+            return
+
+        now = self._clock()
+        presence = self.presences[uid]
+        presence.last_user_interaction = now
+
+        spam = False
+        if msg.kind == "click":
+            brain.notify(BrainEvent.PET_CLICKED)
+            prune_window(pet.click_times, now, window_s=cfg.spam_window_s)
+            pet.click_times.append(now)
+            if len(pet.click_times) >= cfg.spam_clicks:
+                spam = True
+                pet.click_times.clear()
+                brain.notify(BrainEvent.PET_SPAMMED)
+        elif msg.kind == "double_click":
+            brain.notify(BrainEvent.PET_POKED)
+            pet.paused_until = now + cfg.attention_pause_min * 60
+            if pet.pending_command_id is not None:
+                await self._send_pet_command(uid, "stop", {})
+        elif msg.kind == "drag_end":
+            brain.notify(BrainEvent.PET_DRAGGED)
+            pet.paused_until = now + cfg.drag_pause_min * 60
+            pet.anchor = "home"
+
+        key = choose_reaction(msg.kind, brain.mood.snapshot(), spam)
+        if key is None:
+            return
+        name = cfg.reactions.get(key)
+        blocked = (
+            self.eligibility.check(uid, presence) is not None
+            or brain.lifecycle.phase is LifecyclePhase.SLEEP
+        )
+        # A click burst is the "annoyed" reaction itself, so it bypasses the cooldown.
+        cooling = (
+            pet.last_reaction is not None
+            and now - pet.last_reaction < cfg.reaction_cooldown_s
+            and not spam
+        )
+        suppressed = " suppressed" if blocked or cooling else ""
+        logger.info(
+            f"[Pet] interaction {msg.kind} uid={uid} -> reaction {key}({name}){suppressed}"
+        )
+        if blocked or cooling or name is None:
+            return
+
+        live2d_model = getattr(self.client_contexts.get(uid), "live2d_model", None)
+        actions = brain.emotion.apply_reaction(name, live2d_model)
+        if actions is None:
+            return
+        pet.last_reaction = now
+        payload = prepare_audio_payload(
+            audio_path=None, display_text=None, actions=actions
+        )
+        await self._send_json(uid, payload, "reaction")
+
+    async def _pet_lane(self, now: float) -> None:
+        for uid in list(self.pet_presences):
+            brain = self._pet_brain(uid)
+            pet = self.pet_presences.get(uid)
+            if brain is None or pet is None:
+                continue
+            _, category = self._context_for(brain)
+            pet.category_changed = (
+                pet.last_category is not None and category != pet.last_category
+            )
+            pet.last_category = category
+
+            timeout = brain.config.desktop_pet.movement.command_timeout_s
+            if (
+                pet.pending_command_id is not None
+                and pet.pending_since is not None
+                and now - pet.pending_since >= timeout
+            ):
+                logger.warning(
+                    f"[Pet] timeout id={pet.pending_command_id} uid={uid}; clearing"
+                )
+                pet.pending_command_id = None
+                pet.pending_since = None
+                pet.moving = False
+
+            d = self.evaluate_pet(uid)
+            await self._dispatch_pet(uid, d)
+
+    def evaluate_pet(self, uid: str) -> PetDecision:
+        """Synchronous pet-lane decision for one client."""
+
+        brain = self._pet_brain(uid)
+        pet = self.pet_presences.get(uid)
+        presence = self.presences.get(uid)
+        if brain is None or pet is None or presence is None:
+            return PetDecision(PetKind.STAY, "disabled")
+
+        ctx, category = self._context_for(brain)
+        live2d_model = getattr(self.client_contexts.get(uid), "live2d_model", None)
+        d = self.pet_selector.select(
+            PetSelectionInput(
+                now=self._clock(),
+                cfg=brain.config.desktop_pet,
+                presence=pet,
+                mood=brain.mood.snapshot(),
+                lifecycle=brain.lifecycle.phase,
+                context=ctx,
+                category=category,
+                conversation_active=self.eligibility.check(uid, presence) is not None,
+                last_conversation_end=presence.last_conversation_end,
+                motion_map=getattr(live2d_model, "motion_map", None) or {},
+            )
+        )
+        message = f"[Pet] uid={uid} -> {d.kind.name} ({d.reason})"
+        if d.kind is PetKind.STAY:
+            logger.debug(message)
+        else:
+            logger.info(message)
+        return d
+
+    async def _dispatch_pet(self, uid: str, decision: PetDecision) -> None:
+        pet = self.pet_presences.get(uid)
+        if pet is None:
+            return
+        if pet.returned_pending and (
+            decision.kind is PetKind.GO_HOME or pet.anchor == "home"
+        ):
+            pet.returned_pending = False
+
+        command = movement_command(decision)
+        if command is None:
+            return
+        name, params = command
+        command_id = await self._send_pet_command(uid, name, params)
+        if command_id is None:
+            return
+
+        now = self._clock()
+        if decision.kind is PetKind.IDLE_MOTION:
+            pet.last_idle_motion = now
+            prune_window(pet.idle_motion_timestamps, now)
+            pet.idle_motion_timestamps.append(now)
+            logger.info(f"[Motion] idle {decision.params.get('name')} uid={uid}")
+            return
+
+        pet.pending_command_id = command_id
+        pet.pending_since = now
+        pet.moving = True
+        pet.last_move = now
+        prune_window(pet.move_timestamps, now)
+        pet.move_timestamps.append(now)
+        if decision.kind is PetKind.APPROACH_WINDOW:
+            pet.last_contextual = now
+
+    async def _send_pet_command(
+        self, uid: str, command: str, params: dict
+    ) -> Optional[str]:
+        self._pet_command_seq += 1
+        command_id = f"c-{self._pet_command_seq}"
+        payload = {
+            "type": "pet-command",
+            "id": command_id,
+            "command": command,
+            "params": params,
+        }
+        if not await self._send_json(uid, payload, "command"):
+            return None
+        logger.info(f"[Pet] command {command} id={command_id} uid={uid}")
+        return command_id
+
+    async def _send_json(self, uid: str, payload: dict, what: str) -> bool:
+        websocket = self.client_connections.get(uid)
+        if websocket is None:
+            return False
+        try:
+            await websocket.send_text(json.dumps(payload))
+            return True
+        except Exception as e:
+            logger.debug(f"[Pet] {what} send failed uid={uid}: {e}")
+            return False
