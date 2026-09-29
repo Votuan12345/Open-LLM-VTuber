@@ -1,6 +1,6 @@
 import json
 import re
-from typing import List
+from typing import Any, Dict, List
 
 import chardet
 from loguru import logger
@@ -57,8 +57,34 @@ class Live2dModel:
             k.lower(): v for k, v in self.model_info["emotionMap"].items()
         }
         self.emo_str: str = " ".join([f"[{key}]," for key in self.emo_map.keys()])
+        self.motion_map: Dict[str, Dict[str, Any]] = self._load_motion_map(
+            self.model_info.get("motionMap")
+        )
         # emo_str is a string of the keys in the emoMap dictionary. The keys are enclosed in square brackets.
         # example: `"[fear], [anger], [disgust], [sadness], [joy], [neutral], [surprise]"`
+
+    @staticmethod
+    def _load_motion_map(raw: Any) -> Dict[str, Dict[str, Any]]:
+        """Keep valid `motionMap` entries: {name: {"group": str, "index": int >= 0}}."""
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            logger.warning("[Motion] motionMap is not an object; ignored")
+            return {}
+        result: Dict[str, Dict[str, Any]] = {}
+        for name, entry in raw.items():
+            group = entry.get("group") if isinstance(entry, dict) else None
+            index = entry.get("index") if isinstance(entry, dict) else None
+            if (
+                isinstance(group, str)
+                and isinstance(index, int)
+                and not isinstance(index, bool)
+                and index >= 0
+            ):
+                result[name] = {"group": group, "index": index}
+            else:
+                logger.warning(f"[Motion] motionMap entry '{name}' is invalid; ignored")
+        return result
 
     def _load_file_content(self, file_path: str) -> str:
         """Load the content of a file with robust encoding handling."""

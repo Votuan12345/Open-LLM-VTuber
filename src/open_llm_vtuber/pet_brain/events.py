@@ -13,3 +13,7 @@ class BrainEvent(str, Enum):
     USER_RETURNED = "user_returned"
     PROACTIVE_SPOKEN = "proactive_spoken"
     PROACTIVE_IGNORED = "proactive_ignored"
+    PET_CLICKED = "pet_clicked"
+    PET_SPAMMED = "pet_spammed"
+    PET_POKED = "pet_poked"
+    PET_DRAGGED = "pet_dragged"

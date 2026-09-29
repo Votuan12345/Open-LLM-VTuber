@@ -89,7 +89,11 @@ class PetBrain:
         self.config = config
 
     def notify(self, event: BrainEvent, **details: Any) -> None:
-        if event in (BrainEvent.USER_INPUT, BrainEvent.PROACTIVE_TRIGGER):
+        if event in (
+            BrainEvent.USER_INPUT,
+            BrainEvent.PROACTIVE_TRIGGER,
+            BrainEvent.PET_POKED,
+        ):
             self.lifecycle.ensure_active(event.value)
 
         target = EVENT_ACTIVITY.get(event)

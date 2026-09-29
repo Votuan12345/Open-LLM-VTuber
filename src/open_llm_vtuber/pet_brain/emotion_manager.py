@@ -13,6 +13,7 @@ class EmotionSource(str, Enum):
     FALLBACK_INVALID_EXPRESSION = "fallback_invalid_expression"
     EXPRESSION_ONLY = "expression_only"
     IDLE_BEHAVIOR = "idle_behavior"
+    INTERACTION = "interaction"
 
 
 class EmotionManager:
@@ -86,12 +87,23 @@ class EmotionManager:
         Missing keys never raise; they return `None` so nothing is sent.
         The returned `Actions` carries no `emotion` metadata.
         """
+        return self._apply_named(name, live2d_model, EmotionSource.IDLE_BEHAVIOR)
+
+    def apply_reaction(self, name: str, live2d_model: Any) -> Optional[Actions]:
+        """Pet interaction reaction (Phase 3 spec §6.5): same rules as `apply_idle`."""
+        return self._apply_named(name, live2d_model, EmotionSource.INTERACTION)
+
+    def _apply_named(
+        self, name: str, live2d_model: Any, source: EmotionSource
+    ) -> Optional[Actions]:
         emo_map: Optional[Dict[str, Any]] = getattr(live2d_model, "emo_map", None)
         if not emo_map or name not in emo_map:
-            logger.debug(f"[Emotion] idle expression '{name}' not in emotionMap")
+            logger.debug(
+                f"[Emotion] {source.value} expression '{name}' not in emotionMap"
+            )
             return None
         expression = emo_map[name]
-        self._record(name, expression, EmotionSource.IDLE_BEHAVIOR)
+        self._record(name, expression, source)
         return Actions(expressions=[expression])
 
     @staticmethod

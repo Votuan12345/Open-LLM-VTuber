@@ -51,6 +51,10 @@ EVENT_EFFECTS: Dict[BrainEvent, Dict[str, float]] = {
     BrainEvent.USER_RETURNED: {"happiness": 0.05, "curiosity": 0.05},
     BrainEvent.PROACTIVE_SPOKEN: {"social_need": -0.10},
     BrainEvent.PROACTIVE_IGNORED: {"happiness": -0.03},
+    BrainEvent.PET_CLICKED: {"social_need": -0.03, "boredom": -0.05, "happiness": 0.02},
+    BrainEvent.PET_SPAMMED: {"happiness": -0.05},
+    BrainEvent.PET_POKED: {"social_need": -0.05, "curiosity": 0.05},
+    BrainEvent.PET_DRAGGED: {"boredom": -0.05},
 }
 
 # Additional per-hour trend applied on top of TREND_PER_HOUR, only for the

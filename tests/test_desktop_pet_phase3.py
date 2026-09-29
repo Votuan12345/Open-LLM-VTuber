@@ -1,7 +1,11 @@
 """Phase 3A desktop pet tests. Run from repo root: uv run python -m unittest tests.test_desktop_pet_phase3 -v"""
 
+import json
+import os
+import tempfile
 import unittest
 
+from loguru import logger
 from pydantic import ValidationError
 
 from src.open_llm_vtuber.config_manager import (
@@ -14,7 +18,27 @@ from src.open_llm_vtuber.config_manager import (
     read_yaml,
     validate_config,
 )
+from src.open_llm_vtuber.live2d_model import Live2dModel
+from src.open_llm_vtuber.pet_brain import BrainEvent, PetBrain
+from src.open_llm_vtuber.pet_brain.emotion_manager import EmotionManager
+from src.open_llm_vtuber.pet_brain.lifecycle import LifecyclePhase
 from src.open_llm_vtuber.service_context import ServiceContext
+
+MAO_MODEL = Live2dModel("mao_pro")
+
+
+class _LoguruCapture:
+    def __init__(self, level="WARNING"):
+        self._level = level
+
+    def __enter__(self):
+        self.records = []
+        self._id = logger.add(lambda m: self.records.append(str(m)), level=self._level)
+        return self.records
+
+    def __exit__(self, *exc):
+        logger.remove(self._id)
+        return False
 
 
 class ConfigTests(unittest.TestCase):
@@ -109,6 +133,92 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(ctx.init_pet_brain(cfg_b))
         self.assertIs(ctx.pet_brain, brain)
         self.assertEqual(brain.config.desktop_pet.movement.chance, 0.9)
+
+
+class InteractionPrimitiveTests(unittest.TestCase):
+    def _brain(self):
+        return PetBrain(PetBrainConfig(enabled=True))
+
+    def _delta(self, event):
+        brain = self._brain()
+        before = brain.mood.snapshot()
+        brain.notify(event)
+        after = brain.mood.snapshot()
+        return {
+            k: round(after[k] - before[k], 6) for k in before if after[k] != before[k]
+        }
+
+    def test_event_effects(self):
+        self.assertEqual(
+            self._delta(BrainEvent.PET_CLICKED),
+            {"social_need": -0.03, "boredom": -0.05, "happiness": 0.02},
+        )
+        self.assertEqual(self._delta(BrainEvent.PET_SPAMMED), {"happiness": -0.05})
+        self.assertEqual(
+            self._delta(BrainEvent.PET_POKED),
+            {"social_need": -0.05, "curiosity": 0.05},
+        )
+        self.assertEqual(self._delta(BrainEvent.PET_DRAGGED), {"boredom": -0.05})
+
+    def test_event_values(self):
+        self.assertEqual(BrainEvent.PET_CLICKED.value, "pet_clicked")
+        self.assertEqual(BrainEvent.PET_SPAMMED.value, "pet_spammed")
+        self.assertEqual(BrainEvent.PET_POKED.value, "pet_poked")
+        self.assertEqual(BrainEvent.PET_DRAGGED.value, "pet_dragged")
+
+    def test_poked_wakes_from_sleep(self):
+        brain = self._brain()
+        brain.lifecycle.phase = LifecyclePhase.SLEEP
+        brain.notify(BrainEvent.PET_CLICKED)
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.SLEEP)
+        brain.notify(BrainEvent.PET_POKED)
+        self.assertEqual(brain.lifecycle.phase, LifecyclePhase.ACTIVE)
+
+    def test_pet_events_do_not_change_activity(self):
+        brain = self._brain()
+        activity = brain.activity
+        for event in (
+            BrainEvent.PET_CLICKED,
+            BrainEvent.PET_SPAMMED,
+            BrainEvent.PET_POKED,
+            BrainEvent.PET_DRAGGED,
+        ):
+            brain.notify(event)
+            self.assertEqual(brain.activity, activity)
+
+    def test_apply_reaction(self):
+        em = EmotionManager()
+        actions = em.apply_reaction("joy", MAO_MODEL)
+        self.assertEqual(actions.expressions, [3])
+        self.assertEqual(em.snapshot()["current_emotion"], "joy")
+        self.assertEqual(em.snapshot()["current_emotion_source"], "interaction")
+        self.assertIsNone(em.apply_reaction("giggle", MAO_MODEL))
+        self.assertIsNone(em.apply_reaction("joy", object()))
+
+    def test_motion_map_loading(self):
+        entry = {
+            "name": "tmp_model",
+            "url": "/x.model3.json",
+            "emotionMap": {"neutral": 0},
+            "motionMap": {
+                "yawn": {"group": "", "index": 3},
+                "bad": {"group": 1, "index": -1},
+                "worse": "nope",
+            },
+        }
+        plain = dict(entry, name="plain_model")
+        del plain["motionMap"]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "model_dict.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump([entry, plain], f)
+            with _LoguruCapture() as logs:
+                model = Live2dModel("tmp_model", model_dict_path=path)
+            self.assertEqual(model.motion_map, {"yawn": {"group": "", "index": 3}})
+            self.assertTrue(any("motionMap" in r for r in logs))
+            self.assertEqual(
+                Live2dModel("plain_model", model_dict_path=path).motion_map, {}
+            )
 
 
 if __name__ == "__main__":
