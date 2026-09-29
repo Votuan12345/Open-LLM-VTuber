@@ -4,7 +4,10 @@ import inspect
 import json
 import os
 import tempfile
+import copy
 import unittest
+from collections import deque
+from dataclasses import replace
 from datetime import datetime
 
 from loguru import logger
@@ -27,6 +30,20 @@ from src.open_llm_vtuber.pet_brain.context import (
     OWN_PROCESS_NAMES,
     ContextSnapshot,
     WindowsContextSensor,
+)
+from src.open_llm_vtuber.pet_brain.desktop_pet import (
+    PROTOCOL_VERSION,
+    PetDecision,
+    PetHello,
+    PetInteraction,
+    PetKind,
+    PetPresence,
+    PetSelectionInput,
+    PetSelector,
+    PetStatus,
+    choose_reaction,
+    movement_command,
+    parse_pet_message,
 )
 from src.open_llm_vtuber.pet_brain.emotion_manager import EmotionManager
 from src.open_llm_vtuber.pet_brain.lifecycle import LifecyclePhase
@@ -332,6 +349,392 @@ class ForegroundRectTests(unittest.TestCase):
 
     def test_no_window_text_api(self):
         self.assertNotIn("GetWindowText", inspect.getsource(context_module))
+
+
+class ParseTests(unittest.TestCase):
+    def test_parse_valid(self):
+        self.assertEqual(PROTOCOL_VERSION, 1)
+        self.assertEqual(
+            parse_pet_message(
+                {
+                    "type": "pet-hello",
+                    "protocol": 1,
+                    "mode": "pet",
+                    "movement_enabled": True,
+                }
+            ),
+            PetHello(protocol=1, mode="pet", movement_enabled=True),
+        )
+        self.assertEqual(
+            parse_pet_message(
+                {
+                    "type": "pet-status",
+                    "mode": "pet",
+                    "movement_enabled": True,
+                    "moving": False,
+                    "anchor": "edge",
+                    "command_id": "c-42",
+                    "result": "arrived",
+                    "reason": None,
+                }
+            ),
+            PetStatus(
+                mode="pet",
+                movement_enabled=True,
+                moving=False,
+                anchor="edge",
+                command_id="c-42",
+                result="arrived",
+                reason=None,
+            ),
+        )
+        self.assertEqual(
+            parse_pet_message(
+                {
+                    "type": "pet-status",
+                    "mode": "window",
+                    "movement_enabled": False,
+                    "moving": False,
+                }
+            ),
+            PetStatus("window", False, False, None, None, None, None),
+        )
+        self.assertEqual(
+            parse_pet_message(
+                {"type": "pet-interaction", "kind": "click", "hit_area": "HitAreaHead"}
+            ),
+            PetInteraction(kind="click", hit_area="HitAreaHead"),
+        )
+        self.assertEqual(
+            parse_pet_message({"type": "pet-interaction", "kind": "drag_end"}),
+            PetInteraction(kind="drag_end", hit_area=None),
+        )
+
+    def test_parse_rejects_bad_types(self):
+        hello = {
+            "type": "pet-hello",
+            "protocol": 1,
+            "mode": "pet",
+            "movement_enabled": True,
+        }
+        status = {
+            "type": "pet-status",
+            "mode": "pet",
+            "movement_enabled": True,
+            "moving": False,
+        }
+        bad = [
+            dict(hello, protocol="1"),
+            dict(hello, protocol=True),
+            dict(hello, mode="desk"),
+            dict(hello, movement_enabled="yes"),
+            {"type": "pet-interaction", "kind": "kick"},
+            {"type": "pet-interaction", "kind": "click", "hit_area": 5},
+            dict(status, result="done"),
+            dict(status, anchor="moon"),
+            dict(status, moving=1),
+            dict(status, command_id="c" * 65),
+            dict(status, reason=["x"]),
+            {"protocol": 1, "mode": "pet", "movement_enabled": True},
+            {"type": "pet-unknown"},
+            "not a dict",
+            None,
+        ]
+        for data in bad:
+            self.assertIsNone(parse_pet_message(data), data)
+
+    def test_unknown_fields_ignored(self):
+        self.assertEqual(
+            parse_pet_message(
+                {"type": "pet-interaction", "kind": "double_click", "x": 1, "extra": {}}
+            ),
+            PetInteraction(kind="double_click", hit_area=None),
+        )
+
+
+class _FixedRng:
+    def __init__(self, value=0.1):
+        self.value = value
+
+    def random(self):
+        return self.value
+
+
+NOW = 100_000.0
+
+
+def _presence(**overrides):
+    p = PetPresence(protocol=1, mode="pet", movement_enabled=True, anchor="free")
+    for key, value in overrides.items():
+        setattr(p, key, value)
+    return p
+
+
+def make_input(presence=None, cfg=None, **overrides):
+    base = dict(
+        now=NOW,
+        cfg=cfg or DesktopPetConfig(),
+        presence=presence or _presence(),
+        mood={
+            "happiness": 0.6,
+            "energy": 0.7,
+            "curiosity": 0.5,
+            "boredom": 0.8,
+            "social_need": 0.4,
+            "focus": 0.3,
+            "sleepiness": 0.1,
+        },
+        lifecycle=LifecyclePhase.ACTIVE,
+        context=ContextSnapshot(
+            taken_at_wall=datetime(2024, 1, 1, 14, 0),
+            user_idle_seconds=300.0,
+            process_name="chrome.exe",
+            fullscreen=False,
+            foreground_rect=(100, 100, 900, 700),
+        ),
+        category="browser",
+        conversation_active=False,
+        last_conversation_end=None,
+        motion_map={},
+    )
+    base.update(overrides)
+    return PetSelectionInput(**base)
+
+
+def _mood(**changes):
+    return {**make_input().mood, **changes}
+
+
+class SelectorTests(unittest.TestCase):
+    def select(self, inp, rng=0.1):
+        return PetSelector(_FixedRng(rng)).select(inp)
+
+    def test_baseline_wanders(self):
+        d = self.select(make_input())
+        self.assertEqual((d.kind, d.reason), (PetKind.WANDER, "wander"))
+
+    def test_vetoes(self):
+        ctx = make_input().context
+        no_move_cfg = DesktopPetConfig()
+        no_move_cfg.movement.enabled = False
+        cases = [
+            (make_input(presence=_presence(mode="window")), "disabled"),
+            (make_input(presence=_presence(movement_enabled=False)), "disabled"),
+            (make_input(presence=_presence(protocol=None)), "disabled"),
+            (make_input(cfg=DesktopPetConfig(enabled=False)), "disabled"),
+            (make_input(cfg=no_move_cfg), "disabled"),
+            (make_input(presence=_presence(moving=True)), "moving"),
+            (make_input(conversation_active=True), "conversation"),
+            (make_input(last_conversation_end=NOW - 30), "post_conversation"),
+            (make_input(presence=_presence(paused_until=NOW + 10)), "paused"),
+            (make_input(lifecycle=LifecyclePhase.SLEEP), "lifecycle_sleep"),
+            (make_input(lifecycle=LifecyclePhase.AWAY), "lifecycle_away"),
+            (make_input(context=replace(ctx, fullscreen=True)), "fullscreen"),
+            (make_input(context=replace(ctx, fullscreen=None)), "context_unknown"),
+            (
+                make_input(context=replace(ctx, user_idle_seconds=None)),
+                "context_unknown",
+            ),
+        ]
+        for inp, reason in cases:
+            d = self.select(inp)
+            self.assertEqual((d.kind, d.reason), (PetKind.STAY, reason))
+
+    def test_veto_order(self):
+        d = self.select(
+            make_input(presence=_presence(moving=True), conversation_active=True)
+        )
+        self.assertEqual(d.reason, "moving")
+
+    def test_user_returned_goes_home(self):
+        p = _presence(
+            returned_pending=True,
+            last_move=NOW - 10,
+            move_timestamps=deque([NOW - 10] * 8),
+        )
+        d = self.select(make_input(presence=p), rng=0.99)
+        self.assertEqual((d.kind, d.reason), (PetKind.GO_HOME, "user_returned"))
+        p_home = _presence(returned_pending=True, anchor="home")
+        self.assertNotEqual(
+            self.select(make_input(presence=p_home)).kind, PetKind.GO_HOME
+        )
+
+    def test_contextual_approach(self):
+        ctx = make_input().context
+
+        def inp(presence_kw=None, category="unity", curiosity=0.6, **kw):
+            p_kw = {"category_changed": True}
+            p_kw.update(presence_kw or {})
+            return make_input(
+                presence=_presence(**p_kw),
+                category=category,
+                mood=_mood(curiosity=curiosity),
+                **kw,
+            )
+
+        d = self.select(inp(), rng=0.99)
+        self.assertEqual(
+            (d.kind, d.reason), (PetKind.APPROACH_WINDOW, "curious_about_unity")
+        )
+        self.assertEqual(d.params["rect"], (100, 100, 900, 700))
+
+        no_ctx_cfg = DesktopPetConfig()
+        no_ctx_cfg.contextual.enabled = False
+        blocked = [
+            inp(curiosity=0.4),
+            inp(context=replace(ctx, foreground_rect=None)),
+            inp(presence_kw={"last_contextual": NOW - 29 * 60}),
+            inp(category="browser"),
+            inp(cfg=no_ctx_cfg),
+            inp(presence_kw={"category_changed": False}),
+            inp(presence_kw={"move_timestamps": deque([NOW - 60] * 8)}),
+        ]
+        for i in blocked:
+            self.assertNotEqual(self.select(i, rng=0.99).kind, PetKind.APPROACH_WINDOW)
+
+    def test_busy_user_goes_edge_then_stays(self):
+        ctx = replace(make_input().context, user_idle_seconds=5.0)
+
+        def busy(**p_kw):
+            return make_input(
+                presence=_presence(**p_kw), context=ctx, category="coding"
+            )
+
+        d = self.select(busy(last_move=NOW - 90))
+        self.assertEqual((d.kind, d.reason), (PetKind.GO_EDGE, "user_busy"))
+        d = self.select(busy(anchor="edge"))
+        self.assertEqual((d.kind, d.reason), (PetKind.STAY, "user_busy"))
+        d = self.select(busy(last_move=NOW - 30))
+        self.assertEqual((d.kind, d.reason), (PetKind.STAY, "user_busy"))
+        d = self.select(busy(move_timestamps=deque([NOW - 600] * 8)))
+        self.assertEqual((d.kind, d.reason), (PetKind.STAY, "user_busy"))
+
+    def test_frequency_gates(self):
+        recent = _presence(last_move=NOW - 3 * 60)
+        self.assertNotEqual(
+            self.select(make_input(presence=recent)).kind, PetKind.WANDER
+        )
+        capped = _presence(
+            last_move=NOW - 30 * 60, move_timestamps=deque([NOW - 30 * 60] * 8)
+        )
+        self.assertNotEqual(
+            self.select(make_input(presence=capped)).kind, PetKind.WANDER
+        )
+        old = _presence(last_move=NOW - 5 * 60, move_timestamps=deque([NOW - 4000] * 8))
+        self.assertEqual(self.select(make_input(presence=old)).kind, PetKind.WANDER)
+
+    def test_sleepy_goes_edge(self):
+        d = self.select(make_input(mood=_mood(sleepiness=0.8)))
+        self.assertEqual((d.kind, d.reason), (PetKind.GO_EDGE, "sleepy"))
+        d = self.select(make_input(lifecycle=LifecyclePhase.SLEEPY))
+        self.assertEqual((d.kind, d.reason), (PetKind.GO_EDGE, "sleepy"))
+        d = self.select(
+            make_input(presence=_presence(anchor="edge"), mood=_mood(sleepiness=0.8))
+        )
+        self.assertNotEqual(d.kind, PetKind.GO_EDGE)
+
+    def test_too_lazy(self):
+        d = self.select(make_input(mood=_mood(energy=0.1)))
+        self.assertNotEqual(d.kind, PetKind.WANDER)
+
+    def test_wander_distance_and_speed(self):
+        for energy, distance, speed in (
+            (0.7, "long", "normal"),
+            (0.45, "short", "normal"),
+            (0.3, "short", "slow"),
+        ):
+            d = self.select(make_input(mood=_mood(energy=energy)))
+            self.assertEqual(d.kind, PetKind.WANDER)
+            self.assertEqual(d.params, {"distance": distance, "speed": speed})
+        low = _mood(boredom=0.1, curiosity=0.1, energy=0.5, sleepiness=0.1)
+        self.assertNotEqual(self.select(make_input(mood=low)).kind, PetKind.WANDER)
+        self.assertNotEqual(self.select(make_input(), rng=0.5).kind, PetKind.WANDER)
+
+    def test_idle_motion(self):
+        mood = _mood(sleepiness=0.65, boredom=0.1)
+        motion_map = {"yawn": {"group": "", "index": 3}}
+        d = self.select(make_input(mood=mood, motion_map=motion_map))
+        self.assertEqual((d.kind, d.reason), (PetKind.IDLE_MOTION, "idle_motion_yawn"))
+        self.assertEqual(d.params, {"group": "", "index": 3, "name": "yawn"})
+
+        d = self.select(make_input(mood=mood, motion_map={}))
+        self.assertEqual((d.kind, d.reason), (PetKind.STAY, "nothing_to_do"))
+
+        stretch = _mood(energy=0.7, boredom=0.5, sleepiness=0.1, curiosity=0.1)
+        d = self.select(
+            make_input(
+                presence=_presence(last_move=NOW - 60),
+                mood=stretch,
+                motion_map={"stretch": {"group": "", "index": 1}},
+            )
+        )
+        self.assertEqual(d.reason, "idle_motion_stretch")
+
+        gated = _presence(last_idle_motion=NOW - 60)
+        d = self.select(make_input(presence=gated, mood=mood, motion_map=motion_map))
+        self.assertEqual(d.kind, PetKind.STAY)
+        d = self.select(make_input(mood=mood, motion_map=motion_map), rng=0.35)
+        self.assertEqual(d.kind, PetKind.STAY)
+
+    def test_selector_does_not_mutate_presence(self):
+        p = _presence(returned_pending=True, category_changed=True)
+        before = copy.deepcopy(p)
+        self.select(make_input(presence=p))
+        self.assertEqual(p, before)
+
+
+class ReactionTests(unittest.TestCase):
+    def test_choose_reaction(self):
+        m = {"happiness": 0.6, "energy": 0.5}
+        self.assertEqual(choose_reaction("click", m, spam=False), "click_happy")
+        self.assertEqual(
+            choose_reaction("click", {**m, "happiness": 0.4}, spam=False),
+            "click_neutral",
+        )
+        self.assertEqual(choose_reaction("click", m, spam=True), "spam")
+        self.assertEqual(choose_reaction("double_click", m, spam=False), "double_click")
+        self.assertEqual(choose_reaction("drag_end", m, spam=False), "drag_playful")
+        self.assertEqual(
+            choose_reaction("drag_end", {**m, "energy": 0.3}, spam=False),
+            "drag_annoyed",
+        )
+        self.assertIsNone(choose_reaction("drag_start", m, spam=False))
+
+    def test_movement_command_mapping(self):
+        self.assertEqual(
+            movement_command(
+                PetDecision(
+                    PetKind.WANDER, "wander", {"distance": "long", "speed": "slow"}
+                )
+            ),
+            ("wander", {"distance": "long", "speed": "slow"}),
+        )
+        self.assertEqual(
+            movement_command(PetDecision(PetKind.GO_EDGE, "sleepy")),
+            ("go_edge", {"side": "nearest"}),
+        )
+        self.assertEqual(
+            movement_command(PetDecision(PetKind.GO_HOME, "user_returned")),
+            ("go_home", {}),
+        )
+        self.assertEqual(
+            movement_command(
+                PetDecision(PetKind.APPROACH_WINDOW, "c", {"rect": (10, 20, 110, 220)})
+            ),
+            (
+                "approach_rect",
+                {"rect": {"x": 10, "y": 20, "width": 100, "height": 200}},
+            ),
+        )
+        self.assertEqual(
+            movement_command(
+                PetDecision(
+                    PetKind.IDLE_MOTION, "m", {"group": "", "index": 3, "name": "yawn"}
+                )
+            ),
+            ("play_motion", {"group": "", "index": 3}),
+        )
+        self.assertIsNone(movement_command(PetDecision(PetKind.STAY, "nothing_to_do")))
 
 
 if __name__ == "__main__":
