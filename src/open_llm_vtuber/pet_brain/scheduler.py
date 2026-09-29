@@ -683,14 +683,16 @@ class BehaviorScheduler:
         presence.last_user_interaction = now
 
         spam = False
-        if msg.kind == "click":
-            brain.notify(BrainEvent.PET_CLICKED)
+        if msg.kind in ("click", "double_click"):
+            # Rapid clicking reaches us as click/double_click pairs; both count.
             prune_window(pet.click_times, now, window_s=cfg.spam_window_s)
             pet.click_times.append(now)
             if len(pet.click_times) >= cfg.spam_clicks:
                 spam = True
                 pet.click_times.clear()
                 brain.notify(BrainEvent.PET_SPAMMED)
+        if msg.kind == "click":
+            brain.notify(BrainEvent.PET_CLICKED)
         elif msg.kind == "double_click":
             brain.notify(BrainEvent.PET_POKED)
             pet.paused_until = now + cfg.attention_pause_min * 60
@@ -701,7 +703,7 @@ class BehaviorScheduler:
             pet.paused_until = now + cfg.drag_pause_min * 60
             pet.anchor = "home"
 
-        key = choose_reaction(msg.kind, brain.mood.snapshot(), spam)
+        key = "spam" if spam else choose_reaction(msg.kind, brain.mood.snapshot(), spam)
         if key is None:
             return
         name = cfg.reactions.get(key)
@@ -709,13 +711,17 @@ class BehaviorScheduler:
             self.eligibility.check(uid, presence) is not None
             or brain.lifecycle.phase is LifecyclePhase.SLEEP
         )
-        # A click burst is the "annoyed" reaction itself, and a double click
-        # always follows a click by < 350 ms, so both bypass the cooldown.
-        cooling = (
+        # A click burst is the "annoyed" reaction itself and always shows. A
+        # double click always follows a click by < 350 ms, so it bypasses the
+        # cooldown too, except that nothing overrides a fresh "spam" reaction.
+        in_cooldown = (
             pet.last_reaction is not None
             and now - pet.last_reaction < cfg.reaction_cooldown_s
+        )
+        cooling = (
+            in_cooldown
             and not spam
-            and msg.kind != "double_click"
+            and (msg.kind != "double_click" or pet.last_reaction_key == "spam")
         )
         suppressed = " suppressed" if blocked or cooling else ""
         logger.info(
@@ -729,6 +735,7 @@ class BehaviorScheduler:
         if actions is None:
             return
         pet.last_reaction = now
+        pet.last_reaction_key = key
         payload = prepare_audio_payload(
             audio_path=None, display_text=None, actions=actions
         )

@@ -1129,6 +1129,27 @@ class PetInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(_sent(ws, "audio")), 2)
         self.assertEqual(brain.emotion.current_emotion, "surprise")
 
+    async def test_rapid_clicks_count_double_clicks_toward_spam(self):
+        # 5 physical clicks in a row reach the backend as click/double_click pairs.
+        sched, ws, brain, clock, _ = await self._setup()
+        for kind in ("click", "double_click", "click", "double_click", "click"):
+            clock.t += 0.18
+            await sched.handle_pet_message("a", self._click(kind))
+        self.assertEqual(brain.emotion.current_emotion, "anger")
+        self.assertEqual(_sent(ws, "audio")[-1]["actions"], {"expressions": [2]})
+
+    async def test_spam_reaction_is_not_overridden_by_the_burst(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        for kind in ("click", "double_click", "click", "double_click", "click"):
+            clock.t += 0.18
+            await sched.handle_pet_message("a", self._click(kind))
+        sent = len(_sent(ws, "audio"))
+        for kind in ("double_click", "click", "double_click"):
+            clock.t += 0.18
+            await sched.handle_pet_message("a", self._click(kind))
+        self.assertEqual(len(_sent(ws, "audio")), sent)
+        self.assertEqual(brain.emotion.current_emotion, "anger")
+
     async def test_drag_end_pauses_and_sets_home_anchor(self):
         sched, ws, brain, clock, _ = await self._setup()
         await sched.handle_pet_message("a", self._click("drag_start"))

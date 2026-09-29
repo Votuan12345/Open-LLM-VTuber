@@ -163,6 +163,7 @@ class PetPresence:
     last_contextual: Optional[float] = None
     paused_until: Optional[float] = None
     last_reaction: Optional[float] = None
+    last_reaction_key: Optional[str] = None
     click_times: Deque[float] = field(default_factory=deque)
     last_idle_motion: Optional[float] = None
     idle_motion_timestamps: Deque[float] = field(default_factory=deque)
