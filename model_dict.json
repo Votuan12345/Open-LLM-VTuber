@@ -18,6 +18,12 @@
             "sadness": 1,
             "surprise": 3
         },
+        "motionMap": {
+            "look_around": {
+                "group": "",
+                "index": 1
+            }
+        },
         "tapMotions": {
             "HitAreaHead": {
                 "": 1
