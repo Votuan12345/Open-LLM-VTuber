@@ -991,6 +991,51 @@ class PetLaneTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(sched.pet_presences["a"].last_contextual, sched._clock())
 
+    async def test_fast_result_during_send_is_not_lost(self):
+        sched, ws, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+
+        class _EchoWS(_WS):
+            async def send_text(self, message):
+                self.messages.append(message)
+                msg = json.loads(message)
+                if msg.get("type") == "pet-command":
+                    # The frontend answers before the send await returns.
+                    await sched.handle_pet_message(
+                        "a",
+                        {
+                            "type": "pet-status",
+                            "mode": "pet",
+                            "movement_enabled": True,
+                            "moving": False,
+                            "command_id": msg["id"],
+                            "result": "rejected",
+                            "reason": "no_room",
+                        },
+                    )
+
+        sched.client_connections["a"] = _EchoWS()
+        await sched.tick_once()
+        p = sched.pet_presences["a"]
+        self.assertEqual(len(_sent(sched.client_connections["a"], "pet-command")), 1)
+        self.assertIsNone(p.pending_command_id)
+        self.assertFalse(p.moving)
+
+    async def test_failed_send_leaves_no_pending(self):
+        sched, _, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+
+        class _BrokenWS:
+            async def send_text(self, message):
+                raise RuntimeError("closed")
+
+        sched.client_connections["a"] = _BrokenWS()
+        await sched.tick_once()
+        p = sched.pet_presences["a"]
+        self.assertIsNone(p.pending_command_id)
+        self.assertFalse(p.moving)
+        self.assertIsNone(p.last_move)
+
     async def test_disconnect_drops_pet_presence(self):
         sched, _, _, _, _ = make_pet_scheduler()
         await sched.handle_pet_message("a", HELLO)
@@ -1075,6 +1120,14 @@ class PetInteractionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cmds[-1]["command"], "stop")
         self.assertEqual(sched.pet_presences["a"].paused_until, clock.t + 180)
         self.assertEqual(_sent(ws, "audio")[-1]["actions"], {"expressions": [3]})
+
+    async def test_double_click_reaction_after_click(self):
+        sched, ws, brain, clock, _ = await self._setup()
+        await sched.handle_pet_message("a", self._click())
+        clock.t += 0.3
+        await sched.handle_pet_message("a", self._click("double_click"))
+        self.assertEqual(len(_sent(ws, "audio")), 2)
+        self.assertEqual(brain.emotion.current_emotion, "surprise")
 
     async def test_drag_end_pauses_and_sets_home_anchor(self):
         sched, ws, brain, clock, _ = await self._setup()

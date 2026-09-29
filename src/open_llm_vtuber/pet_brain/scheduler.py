@@ -709,11 +709,13 @@ class BehaviorScheduler:
             self.eligibility.check(uid, presence) is not None
             or brain.lifecycle.phase is LifecyclePhase.SLEEP
         )
-        # A click burst is the "annoyed" reaction itself, so it bypasses the cooldown.
+        # A click burst is the "annoyed" reaction itself, and a double click
+        # always follows a click by < 350 ms, so both bypass the cooldown.
         cooling = (
             pet.last_reaction is not None
             and now - pet.last_reaction < cfg.reaction_cooldown_s
             and not spam
+            and msg.kind != "double_click"
         )
         suppressed = " suppressed" if blocked or cooling else ""
         logger.info(
@@ -805,18 +807,21 @@ class BehaviorScheduler:
         if command is None:
             return
         name, params = command
-        command_id = await self._send_pet_command(uid, name, params)
-        if command_id is None:
-            return
-
         now = self._clock()
+
         if decision.kind is PetKind.IDLE_MOTION:
+            if await self._send_pet_command(uid, name, params) is None:
+                return
             pet.last_idle_motion = now
             prune_window(pet.idle_motion_timestamps, now)
             pet.idle_motion_timestamps.append(now)
             logger.info(f"[Motion] idle {decision.params.get('name')} uid={uid}")
             return
 
+        # Mark the command pending *before* the send await: the frontend's
+        # result (or a double click's stop) may be handled during that await.
+        command_id = self._next_command_id()
+        previous = (pet.last_move, pet.last_contextual)
         pet.pending_command_id = command_id
         pet.pending_since = now
         pet.moving = True
@@ -826,11 +831,28 @@ class BehaviorScheduler:
         if decision.kind is PetKind.APPROACH_WINDOW:
             pet.last_contextual = now
 
-    async def _send_pet_command(
-        self, uid: str, command: str, params: dict
-    ) -> Optional[str]:
+        if await self._send_pet_command(uid, name, params, command_id) is None:
+            # Nothing reached the frontend: undo the reservation.
+            if pet.pending_command_id == command_id:
+                pet.pending_command_id = None
+                pet.pending_since = None
+                pet.moving = False
+            pet.last_move, pet.last_contextual = previous
+            if pet.move_timestamps and pet.move_timestamps[-1] == now:
+                pet.move_timestamps.pop()
+
+    def _next_command_id(self) -> str:
         self._pet_command_seq += 1
-        command_id = f"c-{self._pet_command_seq}"
+        return f"c-{self._pet_command_seq}"
+
+    async def _send_pet_command(
+        self,
+        uid: str,
+        command: str,
+        params: dict,
+        command_id: Optional[str] = None,
+    ) -> Optional[str]:
+        command_id = command_id or self._next_command_id()
         payload = {
             "type": "pet-command",
             "id": command_id,
