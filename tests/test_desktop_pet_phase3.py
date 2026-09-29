@@ -365,6 +365,22 @@ class ForegroundRectTests(unittest.TestCase):
         self.assertIn("open-llm-vtuber-electron.exe", OWN_PROCESS_NAMES)
         self.assertIn("electron.exe", OWN_PROCESS_NAMES)
 
+    def test_own_pet_window_is_never_fullscreen(self):
+        # The pet window spans the whole screen; focusing Mili must not look
+        # like a fullscreen app (E2E finding).
+        class _FullscreenSensor(_RectSensor):
+            def _read_fullscreen(self) -> bool:
+                return True
+
+        for process, expected in (
+            ("electron.exe", False),
+            ("open-llm-vtuber-electron.exe", False),
+            ("vlc.exe", True),
+        ):
+            with _LoguruCapture("DEBUG"):
+                snap = _FullscreenSensor(_FakeUser32(), process).sample()
+            self.assertEqual(snap.fullscreen, expected, process)
+
     def test_no_window_text_api(self):
         self.assertNotIn("GetWindowText", inspect.getsource(context_module))
 

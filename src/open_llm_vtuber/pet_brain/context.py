@@ -277,6 +277,15 @@ class WindowsContextSensor:
             logger.debug(f"[Context] fullscreen read failed: {exc}")
             fullscreen = None
 
+        if (
+            fullscreen
+            and process_name is not None
+            and process_name.casefold() in OWN_PROCESS_NAMES
+        ):
+            # Mili's own pet window spans the screen; focusing her is not a
+            # fullscreen app.
+            fullscreen = False
+
         try:
             foreground_rect = self._read_foreground_rect()
         except Exception as exc:
