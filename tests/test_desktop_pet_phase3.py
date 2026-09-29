@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import tempfile
+import asyncio
 import copy
 import random
 import unittest
@@ -217,6 +218,16 @@ class InteractionPrimitiveTests(unittest.TestCase):
         ):
             brain.notify(event)
             self.assertEqual(brain.activity, activity)
+
+    def test_emotion_version_increments_on_every_change(self):
+        em = EmotionManager()
+        v0 = em.version
+        em.apply_reaction("joy", MAO_MODEL)
+        v1 = em.version
+        em.apply_reaction("joy", MAO_MODEL)
+        self.assertEqual((v1, em.version), (v0 + 1, v0 + 2))
+        em.apply_reaction("missing", MAO_MODEL)
+        self.assertEqual(em.version, v0 + 2)
 
     def test_apply_reaction(self):
         em = EmotionManager()
@@ -1149,6 +1160,58 @@ class PetInteractionTests(unittest.IsolatedAsyncioTestCase):
             await sched.handle_pet_message("a", self._click(kind))
         self.assertEqual(len(_sent(ws, "audio")), sent)
         self.assertEqual(brain.emotion.current_emotion, "anger")
+
+    async def _reaction_setup(self):
+        sched, ws, brain, clock, tasks = await self._setup()
+        sched.reaction_hold_s = 0.02
+        return sched, ws, brain, clock, tasks
+
+    async def test_reaction_resets_to_neutral_after_hold(self):
+        sched, ws, brain, _, _ = await self._reaction_setup()
+        await sched.handle_pet_message("a", self._click())
+        self.assertEqual(brain.emotion.current_emotion, "joy")
+        await asyncio.sleep(0.08)
+        self.assertEqual(_sent(ws, "audio")[-1]["actions"], {"expressions": [0]})
+        self.assertEqual(brain.emotion.current_emotion, "neutral")
+        self.assertEqual(len(_sent(ws, "audio")), 2)
+
+    async def test_reaction_reset_skipped_if_another_system_changed_expression(self):
+        sched, ws, brain, _, _ = await self._reaction_setup()
+        await sched.handle_pet_message("a", self._click())
+        # e.g. an idle expression or an LLM tag arrives during the hold
+        brain.emotion.apply_idle("sadness", MAO_MODEL)
+        await asyncio.sleep(0.08)
+        self.assertEqual(len(_sent(ws, "audio")), 1)
+        self.assertEqual(brain.emotion.current_emotion, "sadness")
+
+    async def test_reaction_reset_skipped_during_conversation(self):
+        sched, ws, brain, _, tasks = await self._reaction_setup()
+        await sched.handle_pet_message("a", self._click())
+        tasks["a"] = _RunningTask()
+        await asyncio.sleep(0.08)
+        self.assertEqual(len(_sent(ws, "audio")), 1)
+        self.assertEqual(brain.emotion.current_emotion, "joy")
+
+    async def test_new_reaction_restarts_the_hold(self):
+        sched, ws, brain, clock, _ = await self._reaction_setup()
+        sched.reaction_hold_s = 0.06
+        await sched.handle_pet_message("a", self._click())
+        await asyncio.sleep(0.03)
+        clock.t += 5
+        await sched.handle_pet_message("a", self._click("drag_end"))
+        await asyncio.sleep(0.045)
+        # the first hold has expired but the newer reaction is still showing
+        self.assertEqual(brain.emotion.current_emotion, "smirk")
+        await asyncio.sleep(0.06)
+        self.assertEqual(brain.emotion.current_emotion, "neutral")
+        self.assertEqual(len(_sent(ws, "audio")), 3)
+
+    async def test_disconnect_cancels_pending_reset(self):
+        sched, ws, _, _, _ = await self._reaction_setup()
+        await sched.handle_pet_message("a", self._click())
+        await sched.client_disconnected("a")
+        await asyncio.sleep(0.08)
+        self.assertEqual(len(_sent(ws, "audio")), 1)
 
     async def test_drag_end_pauses_and_sets_home_anchor(self):
         sched, ws, brain, clock, _ = await self._setup()

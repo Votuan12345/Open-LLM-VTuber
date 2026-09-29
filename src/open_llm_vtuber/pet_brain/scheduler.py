@@ -48,6 +48,7 @@ from .desktop_pet import (
     parse_pet_message,
 )
 from .eligibility import ClientEligibility
+from .emotion_manager import EmotionSource
 from .events import BrainEvent
 from .lifecycle import LifecyclePhase
 from .pet_brain import ActivityState, BrainTickInputs, PetBrain
@@ -60,6 +61,8 @@ RETURNED_IDLE_BELOW_S = 30.0
 
 # Inbound `pet-interaction` rate limit per client (Phase 3 spec §5.3).
 PET_INTERACTION_MAX_PER_S = 10
+# An interaction reaction returns to neutral after this long, if still showing.
+REACTION_HOLD_S = 4.0
 
 RunProactiveTurn = Callable[
     [Any, Callable[[str], Awaitable[None]], str, str], Awaitable[None]
@@ -108,6 +111,8 @@ class BehaviorScheduler:
         self.pet_presences: Dict[str, PetPresence] = {}
         self.pet_selector = PetSelector(self.rng)
         self._pet_command_seq = 0
+        self.reaction_hold_s = REACTION_HOLD_S
+        self._reaction_resets: Dict[str, asyncio.Task] = {}
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
 
@@ -133,6 +138,9 @@ class BehaviorScheduler:
         async with self._lock:
             self.presences.pop(uid, None)
             self.pet_presences.pop(uid, None)
+            reset = self._reaction_resets.pop(uid, None)
+            if reset is not None:
+                reset.cancel()
             if self.presences or self._task is None:
                 return
             task = self._task
@@ -739,7 +747,46 @@ class BehaviorScheduler:
         payload = prepare_audio_payload(
             audio_path=None, display_text=None, actions=actions
         )
-        await self._send_json(uid, payload, "reaction")
+        if await self._send_json(uid, payload, "reaction"):
+            self._schedule_reaction_reset(uid, brain, brain.emotion.version)
+
+    def _schedule_reaction_reset(self, uid: str, brain: PetBrain, version: int) -> None:
+        previous = self._reaction_resets.pop(uid, None)
+        if previous is not None:
+            previous.cancel()
+        self._reaction_resets[uid] = asyncio.create_task(
+            self._reset_reaction_later(uid, brain, version)
+        )
+
+    async def _reset_reaction_later(
+        self, uid: str, brain: PetBrain, version: int
+    ) -> None:
+        """Back to neutral only if the reaction is still exactly what is showing."""
+
+        await asyncio.sleep(self.reaction_hold_s)
+        if self._reaction_resets.get(uid) is asyncio.current_task():
+            self._reaction_resets.pop(uid, None)
+        presence = self.presences.get(uid)
+        emotion = brain.emotion
+        if (
+            presence is None
+            or emotion.version != version
+            or emotion.current_emotion_source is not EmotionSource.INTERACTION
+            or self.eligibility.check(uid, presence) is not None
+        ):
+            logger.debug(f"[Pet] reaction reset skipped uid={uid}")
+            return
+        live2d_model = getattr(self.client_contexts.get(uid), "live2d_model", None)
+        actions = emotion.apply_reaction_reset(
+            brain.config.emotion.fallback_emotion, live2d_model
+        )
+        if actions is None:
+            return
+        payload = prepare_audio_payload(
+            audio_path=None, display_text=None, actions=actions
+        )
+        if await self._send_json(uid, payload, "reaction reset"):
+            logger.info(f"[Pet] reaction reset -> {emotion.current_emotion} uid={uid}")
 
     async def _pet_lane(self, now: float) -> None:
         for uid in list(self.pet_presences):

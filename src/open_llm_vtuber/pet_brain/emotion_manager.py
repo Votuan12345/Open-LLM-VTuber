@@ -14,6 +14,7 @@ class EmotionSource(str, Enum):
     EXPRESSION_ONLY = "expression_only"
     IDLE_BEHAVIOR = "idle_behavior"
     INTERACTION = "interaction"
+    REACTION_RESET = "reaction_reset"
 
 
 class EmotionManager:
@@ -55,6 +56,9 @@ class EmotionManager:
         self.current_emotion: Optional[str] = None
         self.current_emotion_source: Optional[EmotionSource] = None
         self.updated_at: Optional[float] = None
+        # Incremented on every recorded change; lets a caller tell whether
+        # anything else changed the expression since it last looked.
+        self.version = 0
 
     def gate(self, actions: Optional[Actions], live2d_model: Any) -> Optional[Actions]:
         emo_map: Optional[Dict[str, Any]] = getattr(live2d_model, "emo_map", None)
@@ -92,6 +96,10 @@ class EmotionManager:
     def apply_reaction(self, name: str, live2d_model: Any) -> Optional[Actions]:
         """Pet interaction reaction (Phase 3 spec §6.5): same rules as `apply_idle`."""
         return self._apply_named(name, live2d_model, EmotionSource.INTERACTION)
+
+    def apply_reaction_reset(self, name: str, live2d_model: Any) -> Optional[Actions]:
+        """Return from an interaction reaction to `name` (Phase 3 review/E2E fix D)."""
+        return self._apply_named(name, live2d_model, EmotionSource.REACTION_RESET)
 
     def _apply_named(
         self, name: str, live2d_model: Any, source: EmotionSource
@@ -152,6 +160,7 @@ class EmotionManager:
         self.current_expression = expression
         self.current_emotion_source = source
         self.updated_at = self._clock()
+        self.version += 1
 
     def snapshot(self) -> Dict[str, Any]:
         return {
