@@ -24,6 +24,9 @@
                 "index": 1
             }
         },
+        "tapMotionIndices": {
+            "": [0, 1, 2]
+        },
         "tapMotions": {
             "HitAreaHead": {
                 "": 1
