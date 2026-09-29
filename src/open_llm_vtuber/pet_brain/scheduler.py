@@ -656,6 +656,10 @@ class BehaviorScheduler:
         await self._handle_interaction(uid, msg)
 
     def _apply_pet_status(self, uid: str, pet: PetPresence, msg: PetStatus) -> None:
+        if (pet.mode, pet.movement_enabled) != (msg.mode, msg.movement_enabled):
+            logger.info(
+                f"[Pet] status uid={uid} mode={msg.mode} movement={msg.movement_enabled}"
+            )
         pet.mode = msg.mode
         pet.movement_enabled = msg.movement_enabled
         if msg.anchor is not None:

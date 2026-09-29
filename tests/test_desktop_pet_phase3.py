@@ -918,6 +918,22 @@ class PetLaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.anchor, "edge")
         self.assertEqual(p.last_move, clock.t)
 
+    async def test_status_change_is_logged(self):
+        sched, _, _, _, _ = make_pet_scheduler()
+        await sched.handle_pet_message("a", HELLO)
+        status = {
+            "type": "pet-status",
+            "mode": "pet",
+            "movement_enabled": False,
+            "moving": False,
+        }
+        with _LoguruCapture("INFO") as logs:
+            await sched.handle_pet_message("a", status)
+            await sched.handle_pet_message("a", status)
+        changes = [r for r in logs if "[Pet] status" in r]
+        self.assertEqual(len(changes), 1)
+        self.assertIn("movement=False", changes[0])
+
     async def test_status_updates_mode_and_toggle(self):
         sched, ws, _, _, _ = make_pet_scheduler()
         await sched.handle_pet_message("a", HELLO)
