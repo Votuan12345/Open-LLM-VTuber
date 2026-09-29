@@ -1,6 +1,6 @@
 # config_manager/pet_brain.py
 from pydantic import Field, model_validator
-from typing import Dict, ClassVar, Literal
+from typing import Dict, ClassVar, List, Literal
 from .i18n import I18nMixin, Description
 
 Category = Literal["coding", "unity", "office", "browser", "media", "gaming", "unknown"]
@@ -182,6 +182,197 @@ class ContextConfig(I18nMixin):
     }
 
 
+ReactionKey = Literal[
+    "click_happy",
+    "click_neutral",
+    "spam",
+    "double_click",
+    "drag_playful",
+    "drag_annoyed",
+]
+
+DEFAULT_REACTIONS: Dict[ReactionKey, str] = {
+    "click_happy": "joy",
+    "click_neutral": "surprise",
+    "spam": "anger",
+    "double_click": "surprise",
+    "drag_playful": "smirk",
+    "drag_annoyed": "anger",
+}
+
+
+class PetMovementConfig(I18nMixin):
+    """Autonomous desktop movement (Phase 3A) settings."""
+
+    enabled: bool = Field(True, alias="enabled")
+    min_interval_min: float = Field(4.0, alias="min_interval_min", ge=0)
+    max_per_hour: int = Field(8, alias="max_per_hour", ge=0)
+    chance: float = Field(0.4, alias="chance", ge=0, le=1)
+    wander_threshold: float = Field(0.35, alias="wander_threshold", ge=0, le=1)
+    post_conversation_quiet_min: float = Field(
+        1.0, alias="post_conversation_quiet_min", ge=0
+    )
+    command_timeout_s: float = Field(60.0, alias="command_timeout_s", ge=0)
+
+    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+        "enabled": Description(en="Enable autonomous movement.", zh="启用自主移动。"),
+        "min_interval_min": Description(
+            en="Minimum minutes between movements.",
+            zh="两次移动之间的最小间隔（分钟）。",
+        ),
+        "max_per_hour": Description(
+            en="Maximum movements per rolling hour.", zh="每小时内移动的最大次数。"
+        ),
+        "chance": Description(
+            en="Probability of moving once eligible.", zh="满足条件后实际移动的概率。"
+        ),
+        "wander_threshold": Description(
+            en="Minimum wander score (boredom/curiosity/energy/sleepiness) needed to wander.",
+            zh="闲逛所需的最小分数（无聊/好奇/精力/困倦）。",
+        ),
+        "post_conversation_quiet_min": Description(
+            en="Minutes after a conversation ends before movement can start.",
+            zh="对话结束后多少分钟内不移动。",
+        ),
+        "command_timeout_s": Description(
+            en="Seconds after which an unanswered movement command is dropped.",
+            zh="移动命令未收到结果多少秒后视为超时。",
+        ),
+    }
+
+
+class PetContextualConfig(I18nMixin):
+    """Contextual movement: approach the window the user just switched to."""
+
+    enabled: bool = Field(True, alias="enabled")
+    categories: List[Category] = Field(
+        default_factory=lambda: ["coding", "unity"], alias="categories"
+    )
+    min_curiosity: float = Field(0.5, alias="min_curiosity", ge=0, le=1)
+    cooldown_min: float = Field(30.0, alias="cooldown_min", ge=0)
+
+    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+        "enabled": Description(
+            en="Enable contextual movement (uses the foreground window rectangle, never its title).",
+            zh="启用情境移动（使用前台窗口位置，从不读取标题）。",
+        ),
+        "categories": Description(
+            en="Process categories that trigger an approach when the user switches to them.",
+            zh="切换到这些进程分类时触发靠近。",
+        ),
+        "min_curiosity": Description(
+            en="Minimum curiosity needed to approach.", zh="靠近所需的最小好奇心。"
+        ),
+        "cooldown_min": Description(
+            en="Minimum minutes between contextual approaches.",
+            zh="两次情境靠近之间的最小间隔（分钟）。",
+        ),
+    }
+
+
+class PetInteractionConfig(I18nMixin):
+    """Reactions to click / double-click / drag on the pet."""
+
+    enabled: bool = Field(True, alias="enabled")
+    reaction_cooldown_s: float = Field(3.0, alias="reaction_cooldown_s", ge=0)
+    spam_clicks: int = Field(5, alias="spam_clicks", ge=2)
+    spam_window_s: float = Field(10.0, alias="spam_window_s", ge=0)
+    drag_pause_min: float = Field(5.0, alias="drag_pause_min", ge=0)
+    attention_pause_min: float = Field(3.0, alias="attention_pause_min", ge=0)
+    reactions: Dict[ReactionKey, str] = Field(
+        default_factory=lambda: dict(DEFAULT_REACTIONS), alias="reactions"
+    )
+
+    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+        "enabled": Description(en="Enable interaction reactions.", zh="启用互动反应。"),
+        "reaction_cooldown_s": Description(
+            en="Seconds between two reaction expressions.",
+            zh="两次反应表情之间的秒数。",
+        ),
+        "spam_clicks": Description(
+            en="Clicks within spam_window_s that count as click spam.",
+            zh="在 spam_window_s 内达到该点击次数视为连点。",
+        ),
+        "spam_window_s": Description(
+            en="Window in seconds for click spam detection.",
+            zh="连点检测的时间窗口（秒）。",
+        ),
+        "drag_pause_min": Description(
+            en="Minutes autonomous movement pauses after the user drags the pet.",
+            zh="用户拖动后暂停自主移动的分钟数。",
+        ),
+        "attention_pause_min": Description(
+            en="Minutes autonomous movement pauses after a double-click.",
+            zh="双击后暂停自主移动的分钟数。",
+        ),
+        "reactions": Description(
+            en="Reaction key to emotionMap key: click_happy, click_neutral, spam, double_click, drag_playful, drag_annoyed.",
+            zh="反应键到 emotionMap 键的映射：click_happy, click_neutral, spam, double_click, drag_playful, drag_annoyed。",
+        ),
+    }
+
+    @model_validator(mode="after")
+    def _fill_missing_reactions(self) -> "PetInteractionConfig":
+        self.reactions = {**DEFAULT_REACTIONS, **self.reactions}
+        return self
+
+
+class PetIdleMotionConfig(I18nMixin):
+    """Idle motions (yawn / stretch / look_around) from the model's motionMap."""
+
+    enabled: bool = Field(True, alias="enabled")
+    min_interval_min: float = Field(5.0, alias="min_interval_min", ge=0)
+    max_per_hour: int = Field(6, alias="max_per_hour", ge=0)
+    chance: float = Field(0.3, alias="chance", ge=0, le=1)
+
+    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+        "enabled": Description(en="Enable idle motions.", zh="启用空闲动作。"),
+        "min_interval_min": Description(
+            en="Minimum minutes between idle motions.",
+            zh="两次空闲动作之间的最小间隔（分钟）。",
+        ),
+        "max_per_hour": Description(
+            en="Maximum idle motions per rolling hour.",
+            zh="每小时内空闲动作的最大次数。",
+        ),
+        "chance": Description(
+            en="Probability of playing an idle motion once eligible.",
+            zh="满足条件后实际播放空闲动作的概率。",
+        ),
+    }
+
+
+class DesktopPetConfig(I18nMixin):
+    """Phase 3A desktop pet: movement, contextual movement, interactions, idle motions."""
+
+    enabled: bool = Field(True, alias="enabled")
+    movement: PetMovementConfig = Field(
+        default_factory=PetMovementConfig, alias="movement"
+    )
+    contextual: PetContextualConfig = Field(
+        default_factory=PetContextualConfig, alias="contextual"
+    )
+    interaction: PetInteractionConfig = Field(
+        default_factory=PetInteractionConfig, alias="interaction"
+    )
+    idle_motion: PetIdleMotionConfig = Field(
+        default_factory=PetIdleMotionConfig, alias="idle_motion"
+    )
+
+    DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
+        "enabled": Description(
+            en="Enable the desktop pet lane. Only effective when pet_brain_config.enabled and behavior.enabled.",
+            zh="启用桌宠行为。仅在 pet_brain_config.enabled 和 behavior.enabled 为 True 时生效。",
+        ),
+        "movement": Description(en="Autonomous movement settings", zh="自主移动设置"),
+        "contextual": Description(en="Contextual movement settings", zh="情境移动设置"),
+        "interaction": Description(
+            en="Interaction reaction settings", zh="互动反应设置"
+        ),
+        "idle_motion": Description(en="Idle motion settings", zh="空闲动作设置"),
+    }
+
+
 class PetBrainConfig(I18nMixin):
     """Configuration for the PetBrain companion core."""
 
@@ -200,6 +391,9 @@ class PetBrainConfig(I18nMixin):
         default_factory=IdleExpressionConfig, alias="idle_expression"
     )
     context: ContextConfig = Field(default_factory=ContextConfig, alias="context")
+    desktop_pet: DesktopPetConfig = Field(
+        default_factory=DesktopPetConfig, alias="desktop_pet"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "enabled": Description(
@@ -216,4 +410,5 @@ class PetBrainConfig(I18nMixin):
             en="Idle expression settings", zh="空闲表情设置"
         ),
         "context": Description(en="Context awareness settings", zh="上下文感知设置"),
+        "desktop_pet": Description(en="Desktop pet settings", zh="桌宠设置"),
     }

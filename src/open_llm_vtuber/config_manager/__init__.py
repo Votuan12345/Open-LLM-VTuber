@@ -51,6 +51,11 @@ from .pet_brain import (
     ProactiveConfig,
     IdleExpressionConfig,
     ContextConfig,
+    DesktopPetConfig,
+    PetMovementConfig,
+    PetContextualConfig,
+    PetInteractionConfig,
+    PetIdleMotionConfig,
 )
 from .i18n import I18nMixin, Description, MultiLingualString
 from .agent import (
@@ -129,6 +134,11 @@ __all__ = [
     "ProactiveConfig",
     "IdleExpressionConfig",
     "ContextConfig",
+    "DesktopPetConfig",
+    "PetMovementConfig",
+    "PetContextualConfig",
+    "PetInteractionConfig",
+    "PetIdleMotionConfig",
     # i18n related classes
     "I18nMixin",
     "Description",

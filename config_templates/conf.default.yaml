@@ -558,6 +558,41 @@ character_config:
         steam.exe: gaming
         EpicGamesLauncher.exe: gaming
 
+    desktop_pet:
+      enabled: True            # only effective when pet_brain_config.enabled and behavior.enabled
+      movement:                # autonomous movement in Pet Mode (Electron app)
+        enabled: True
+        min_interval_min: 4
+        max_per_hour: 8
+        chance: 0.4
+        wander_threshold: 0.35
+        post_conversation_quiet_min: 1
+        command_timeout_s: 60
+      contextual:              # approach the window the user switches to (rectangle only, never the title)
+        enabled: True
+        categories: ['coding', 'unity']
+        min_curiosity: 0.5
+        cooldown_min: 30
+      interaction:             # reactions to click / double-click / drag (values are emotionMap keys)
+        enabled: True
+        reaction_cooldown_s: 3
+        spam_clicks: 5
+        spam_window_s: 10
+        drag_pause_min: 5
+        attention_pause_min: 3
+        reactions:
+          click_happy: 'joy'
+          click_neutral: 'surprise'
+          spam: 'anger'
+          double_click: 'surprise'
+          drag_playful: 'smirk'
+          drag_annoyed: 'anger'
+      idle_motion:             # uses the model's motionMap in model_dict.json (yawn / stretch / look_around)
+        enabled: True
+        min_interval_min: 5
+        max_per_hour: 6
+        chance: 0.3
+
 # Live Streaming Integration
 live_config:
   bilibili_live:

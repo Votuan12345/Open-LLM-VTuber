@@ -554,6 +554,41 @@ character_config:
         steam.exe: gaming
         EpicGamesLauncher.exe: gaming
 
+    desktop_pet:
+      enabled: True            # 仅在 pet_brain_config.enabled 和 behavior.enabled 为 True 时生效
+      movement:                # 桌宠模式下的自主移动（Electron 应用）
+        enabled: True
+        min_interval_min: 4
+        max_per_hour: 8
+        chance: 0.4
+        wander_threshold: 0.35
+        post_conversation_quiet_min: 1
+        command_timeout_s: 60
+      contextual:              # 靠近用户切换到的窗口（只使用窗口位置，从不读取标题）
+        enabled: True
+        categories: ['coding', 'unity']
+        min_curiosity: 0.5
+        cooldown_min: 30
+      interaction:             # 对单击 / 双击 / 拖动的反应（值为 emotionMap 键）
+        enabled: True
+        reaction_cooldown_s: 3
+        spam_clicks: 5
+        spam_window_s: 10
+        drag_pause_min: 5
+        attention_pause_min: 3
+        reactions:
+          click_happy: 'joy'
+          click_neutral: 'surprise'
+          spam: 'anger'
+          double_click: 'surprise'
+          drag_playful: 'smirk'
+          drag_annoyed: 'anger'
+      idle_motion:             # 使用 model_dict.json 中模型的 motionMap（yawn / stretch / look_around）
+        enabled: True
+        min_interval_min: 5
+        max_per_hour: 6
+        chance: 0.3
+
 # 直播平台集成
 live_config:
   bilibili_live:
